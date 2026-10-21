@@ -17,7 +17,7 @@ zmodload zsh/datetime 2>/dev/null   # EPOCHREALTIME / strftime，用于计时与
 setopt no_unset
 unsetopt pipe_fail 2>/dev/null
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 # ── 云枢固定结构（如后续版本变动，改这里即可） ─────────────────────────
 UI_APP="/Applications/Yunshu.app"
@@ -213,6 +213,12 @@ tunnel_info() {
     if (( _ti_ok )); then print -r -- "$_ti_out"; return 0; fi
     return 1
   fi
+  # 先确认云枢自己在跑：否则会把 Clash / Surge 之类工具的 TUN 模式（fake-IP 198.18.0.0/15）
+  # 误判成"云枢已连接"。这一步只有 pgrep，开销几毫秒。
+  if ! ys_alive; then
+    _ti_t=${EPOCHREALTIME:-0}; _ti_ok=0; _ti_out=""
+    return 1
+  fi
   local out
   out=$(netstat -rn -f inet 2>/dev/null | awk '
     $NF ~ /^utun/ { c[$NF " " $2]++ }
@@ -221,6 +227,22 @@ tunnel_info() {
       for (k in c) if (c[k] > n) { n = c[k]; best = k }
       if (n >= 5) print best, n
     }')
+  # 部分路由（例如 default）的网关是 `link#26` 这种接口引用，直接显示不直观。
+  # 这种情况改用该接口自己的 inet 地址（云枢隧道是点对点，网关就是它本机地址）。
+  if [[ -n $out ]]; then
+    local iface rest gw ip
+    iface=${out%% *}; rest=${out#* }; gw=${rest%% *}
+    if [[ $gw == link#* ]]; then
+      ip=$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}')
+      [[ -n $ip ]] && out="$iface $ip ${rest#* }"
+    else
+      ip=$gw
+    fi
+    # 198.18.0.0/15 是 RFC 2544 基准测试网段，只有代理类工具会拿它做 fake-IP，企业 VPN 不会。
+    case "$ip" in
+      198.18.*|198.19.*) out="" ;;
+    esac
+  fi
   _ti_t=${EPOCHREALTIME:-0}
   if [[ -z $out ]]; then
     _ti_ok=0; _ti_out=""
@@ -232,6 +254,11 @@ tunnel_info() {
 
 # 轮询专用：跳过缓存，拿真实值
 tunnel_fresh() { _ti_t=0; tunnel_info }
+
+# 云枢关键进程在不在：隧道判定必须先过这一关（防止把其它 TUN 型 VPN 当成云枢）
+ys_alive() {
+  pgrep -q -f 'YunshuManager|YunshuAgent|/Applications/Yunshu\.app/Contents/MacOS/' 2>/dev/null
+}
 
 ys_pids() {
   pgrep -fl -i 'YunshuAgent|YunshuManager|YunshuPluginService|com\.eagleyun\.sase\.helper|/opt/\.yunshu/|/Applications/Yunshu\.app/Contents/MacOS' 2>/dev/null
