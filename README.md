@@ -33,7 +33,9 @@
 
 ## 📦 下载安装（30 秒）
 
-**① 下载安装盘** → [**dist/YunShuSwitch.dmg**](dist/YunShuSwitch.dmg)（约 700 KB）
+**① 下载安装盘** → [**Releases · 最新版 YunShuSwitch.dmg**](../../releases/latest)（约 700 KB）
+
+> 也可以直接用仓库里的 [`dist/YunShuSwitch.dmg`](dist/YunShuSwitch.dmg)，与 Release 内容等价。
 
 **② 双击打开，把左边的「云枢开关」拖到右边的「应用程序」**
 
