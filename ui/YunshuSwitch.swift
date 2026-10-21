@@ -20,11 +20,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private var headerItem: NSMenuItem!
+    private var detailItem: NSMenuItem!
     private var connectItem: NSMenuItem!
     private var disconnectItem: NSMenuItem!
     private var timer: Timer?
     private var axTimer: Timer?
+    private var trustTimer: Timer?
     private var busy = false
+    private var currentState = ""          // connected / idle / off
+    private var trustWatchTicks = 0
 
     private let supportDir = NSHomeDirectory() + "/Library/Application Support/YunshuSwitch"
     private var reqPath: String { supportDir + "/ax.request" }
@@ -49,8 +53,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logLine("launched, ysctl=\(ysctlPath() ?? "nil") trusted=\(AXIsProcessTrusted())")
 
         if !AXIsProcessTrusted() {
-            // 首次运行：系统会弹出「辅助功能」请求，用户点一次即可
-            _ = requestTrust(prompt: true)
+            // 首次运行（或换了签名/安装位置后）：先清掉本 App 的旧授权记录，
+            // 否则「辅助功能」列表里会留着指向旧副本的那一条 —— 用户勾了它，
+            // 当前进程却依然不被信任，表现就是"明明打开了权限还一直提示"。
+            resetAXTrust()
         }
         writeTrustStatus()
 
@@ -134,10 +140,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenu() {
         menu.autoenablesItems = false
+        menu.delegate = self          // 每次展开菜单先刷一次，不用等 8 秒轮询
 
         headerItem = NSMenuItem(title: "云枢：状态读取中…", action: nil, keyEquivalent: "")
-        headerItem.isEnabled = false
+        headerItem.isEnabled = true       // 保持可用，否则系统会把彩色圆点一起置灰
         menu.addItem(headerItem)
+
+        // 第二行只在已连接时显示：隧道 / 地址 / 路由条数
+        detailItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        detailItem.isEnabled = true
+        detailItem.isHidden = true
+        menu.addItem(detailItem)
+
         menu.addItem(.separator())
 
         connectItem = NSMenuItem(title: "连接内网（启动并连接）", action: #selector(doUp), keyEquivalent: "")
@@ -155,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add("一键修复（免密/授权）", #selector(doFix), "")
         add("安装命令行工具（ysctl）", #selector(doInstallCLI), "")
         add("辅助功能权限设置…", #selector(openAXSettings), "")
+        add("重置辅助功能授权（反复提示时用）", #selector(doResetAX), "")
         add("诊断：导出云枢界面元素", #selector(doDump), "")
 
         menu.addItem(.separator())
@@ -194,22 +209,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         DispatchQueue.global(qos: .utility).async {
-            let state = self.capture([ys, "state"])
+            let line = self.capture([ys, "statusline"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = line.split(separator: " ").map(String.init)
+            let state = parts.first ?? "off"
             DispatchQueue.main.async {
-                switch state {
-                case "connected":
-                    self.headerItem.title = "云枢：已连接企业内网"
-                    self.statusItem.button?.image = self.symbol("network")
-                case "idle":
-                    self.headerItem.title = "云枢：已启动，未连接"
-                    self.statusItem.button?.image = self.symbol("network.slash")
-                default:
-                    self.headerItem.title = "云枢：已完全停用"
-                    self.statusItem.button?.image = self.symbol("network.slash")
-                }
+                self.currentState = state
+                self.apply(state: state, parts: parts)
                 self.writeTrustStatus()
             }
         }
+    }
+
+    /// 把状态映射到：菜单栏图标 + 提示 + 菜单首行文字 + 两个动作项的可点性
+    private func apply(state: String, parts: [String]) {
+        let green = NSColor.systemGreen
+        let orange = NSColor.systemOrange
+        let gray = NSColor.secondaryLabelColor
+
+        var dot = gray
+        var text = "已完全停用"
+        var icon = "network.slash"
+        var tint = gray
+
+        switch state {
+        case "connected":
+            dot = green
+            tint = green
+            icon = "network"
+            text = "已连接企业内网"
+            if parts.count >= 4 {
+                detailItem.attributedTitle = NSAttributedString(
+                    string: "隧道 \(parts[1]) · \(parts[2]) · \(parts[3]) 条路由",
+                    attributes: [
+                        .foregroundColor: NSColor.secondaryLabelColor,
+                        .font: NSFont.systemFont(ofSize: 11)
+                    ])
+                detailItem.isHidden = false
+            } else {
+                detailItem.isHidden = true
+            }
+        case "idle":
+            dot = orange
+            tint = orange
+            icon = "network"
+            text = "云枢已启动，未连接内网"
+            detailItem.isHidden = true
+        default:
+            text = "已完全停用（守护进程禁用）"
+            detailItem.isHidden = true
+        }
+
+        // 图标：已连接＝实心云网 + 绿；未连接＝斜杠 + 灰
+        statusItem.button?.image = symbol(icon)
+        statusItem.button?.contentTintColor = tint
+        statusItem.button?.toolTip = "云枢：\(text)"
+
+        // 首行：彩色圆点 + 状态文字
+        let title = NSMutableAttributedString(string: "● ", attributes: [
+            .foregroundColor: dot,
+            .font: NSFont.systemFont(ofSize: 12)
+        ])
+        title.append(NSAttributedString(string: text, attributes: [
+            .foregroundColor: NSColor.labelColor,
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium)
+        ]))
+        headerItem.attributedTitle = title
+
+        // 已连接时「连接内网」置灰，已停用时「断开并禁用」置灰
+        let connected = (state == "connected")
+        connectItem.isEnabled = !connected
+        connectItem.title = connected ? "已连接内网（无需重复连接）" : "连接内网（启动并连接）"
+
+        let off = (state == "off")
+        disconnectItem.isEnabled = !off
+        disconnectItem.title = off ? "云枢已完全停用" : "断开并禁用（彻底退出）"
     }
 
     // MARK: - 动作
@@ -239,21 +312,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func ensureTrust(_ completion: @escaping (Bool) -> Void) {
         if AXIsProcessTrusted() { completion(true); return }
         _ = requestTrust(prompt: true)
-        let alert = NSAlert()
-        alert.messageText = "需要「辅助功能」权限"
-        alert.informativeText = """
-        要在云枢界面上自动点「立即连接 / 断开连接」，本工具需要辅助功能权限。
 
-        打开「系统设置 → 隐私与安全性 → 辅助功能」，把「云枢开关」勾选上，然后回到这里再操作一次。
-        只需要授权这一次，之后一键操作都不再打扰你。
+        let alert = NSAlert()
+        alert.messageText = "还差「辅助功能」权限"
+        alert.informativeText = """
+        要在云枢界面里替你点「连接网络 / 断开网络」，需要「辅助功能」权限。
+
+        ▸ 如果列表里「云枢开关」已经是勾上的，说明那条记录指向了旧位置
+          （重装、换目录、或版本签名变化后很常见）。处理办法：
+          1. 点下面的「重置并重新授权」，会清掉旧记录；
+          2. 列表里只剩一条「云枢开关」，把它勾上即可。
+
+        ▸ 授权完成后本工具会自动继续刚才的操作，不用再回来点一次。
         """
+        alert.addButton(withTitle: "重置并重新授权")
         alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "已授权，重试")
         alert.addButton(withTitle: "取消")
+        alert.window.level = .floating
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            resetAXTrust()
             openAXSettings()
+            watchTrust { completion(true) }
+        case .alertSecondButtonReturn:
+            openAXSettings()
+            watchTrust { completion(true) }
+        case .alertThirdButtonReturn:
+            if AXIsProcessTrusted() { completion(true) } else { watchTrust { completion(true) } }
+        default:
+            completion(false)
         }
-        completion(false)
+    }
+
+    /// 清掉本 App 的辅助功能授权记录（TCC），用于"勾了还提示"的旧记录错位。
+    private func resetAXTrust() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", "Accessibility", "com.shiwuhao.yunshuswitch"]
+        try? p.run()
+        p.waitUntilExit()
+        logLine("tccutil reset Accessibility rc=\(p.terminationStatus)")
+        _ = requestTrust(prompt: true)      // 让系统立刻把新的一条加进列表
+    }
+
+    /// 轮询等待用户去系统设置里授权，一旦生效就自动继续（最多 2 分钟）
+    private func watchTrust(_ done: @escaping () -> Void) {
+        trustTimer?.invalidate()
+        trustWatchTicks = 0
+        trustTimer = Timer(timeInterval: 1, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            self.trustWatchTicks += 1
+            if AXIsProcessTrusted() {
+                t.invalidate()
+                self.logLine("trust granted after \(self.trustWatchTicks)s, 自动继续")
+                self.writeTrustStatus()
+                done()
+                return
+            }
+            if self.trustWatchTicks >= 120 {
+                t.invalidate()
+                self.logLine("trust watch timeout (120s)")
+                self.show("仍未获得「辅助功能」权限",
+                          """
+                          列表里那条记录可能指向了旧版本。点菜单「重置辅助功能授权（反复提示时用）」，\
+                          再回到「辅助功能」里勾选新出现的那一条。
+                          """,
+                          isError: true)
+            }
+        }
+        RunLoop.main.add(trustTimer!, forMode: .common)
+    }
+
+    @objc private func doResetAX() {
+        resetAXTrust()
+        openAXSettings()
+        show("已清空旧的授权记录",
+              """
+              请在「辅助功能」里把「云枢开关」勾选（若列表里没有，点左下角 + 手动添加 \
+              /Applications/云枢开关.app）。勾上后本工具会自动恢复可用。
+              """,
+              isError: false)
+        watchTrust { [weak self] in
+            self?.refresh()
+        }
     }
 
     private func perform(_ args: [String], name: String) {
@@ -720,6 +864,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         alert.runModal()
+    }
+}
+
+// 每次展开菜单都先刷一次状态，避免"刚连上但菜单还显示未连接"
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
     }
 }
 

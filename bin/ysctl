@@ -17,7 +17,7 @@ zmodload zsh/datetime 2>/dev/null   # EPOCHREALTIME / strftime，用于计时与
 setopt no_unset
 unsetopt pipe_fail 2>/dev/null
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 # ── 云枢固定结构（如后续版本变动，改这里即可） ─────────────────────────
 UI_APP="/Applications/Yunshu.app"
@@ -851,6 +851,19 @@ cmd_state() {
   fi
 }
 
+# 给菜单栏 App 用：一行同时给出状态和隧道细节，省一次进程调用
+#   输出：connected utun7 10.251.1.1 361   /   idle   /   off
+cmd_statusline() {
+  local ti
+  if ti=$(tunnel_info); then
+    print -r -- "connected $ti"
+  elif [[ -n $(ys_pids) ]] || [[ $(job_state "system/$MGR_LABEL") == running ]]; then
+    print idle
+  else
+    print off
+  fi
+}
+
 # ── doctor ─────────────────────────────────────────────────────────────
 cmd_doctor() {
   print -r -- "ysctl doctor — 环境自检"
@@ -1038,6 +1051,7 @@ ysctl — 云枢一键开关
   ysctl toggle           已连接则断开，否则连接
   ysctl status           查看详细状态
   ysctl state            仅输出 connected / idle / off
+  ysctl statusline       单行状态（给菜单栏 App 用）：connected utun7 10.251.1.1 361
   ysctl auto on|off      开关云枢「自动连接内网」（对应设置里的同名开关）
   ysctl setup [--force]  安装免密助手（只需输一次密码，之后 up/down 不再弹框）
   ysctl fix              一键修复：重写免密规则 + 校正辅助功能 + 自检
@@ -1058,6 +1072,7 @@ case "$cmd" in
   toggle)   cmd_toggle "$@" ;;
   status)   cmd_status ;;
   state)    cmd_state ;;
+  statusline) cmd_statusline ;;
   auto)     cmd_auto "$@" ;;
   doctor)   cmd_doctor ;;
   ui-dump)  cmd_ui_dump ;;
