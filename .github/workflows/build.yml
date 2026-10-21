@@ -26,19 +26,28 @@ jobs:
       - name: 编译菜单栏 App
         run: ./build.sh
 
+      # CI 里不跑 make-dmg.sh：它会 diskutil 挂载镜像再写 .DS_Store 排版，
+      # 在无图形会话的 runner 上不稳定。这里用 hdiutil 直接成型，内容一样（少个背景图）。
       - name: 打包 DMG
         run: |
-          # .DS_Store 排版需要 ds_store；装不上也不影响（脚本会跳过美化）
-          python3 -m pip install --user --quiet ds_store mac_alias || true
-          ./make-dmg.sh
+          set -e
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' ui/Info.plist)
+          STAGE=build/ci-stage
+          rm -rf "$STAGE" && mkdir -p "$STAGE" dist
+          cp -R build/YunshuSwitch.app "$STAGE/云枢开关.app"
+          ln -s /Applications "$STAGE/应用程序"
+          cp assets/使用说明.txt "$STAGE/使用说明.txt"
+          hdiutil create -volname "云枢开关" -srcfolder "$STAGE" -fs HFS+ \
+            -format UDZO -ov "dist/YunShuSwitch.dmg"
+          ls -lh dist/YunShuSwitch.dmg
+          echo "版本 $VERSION"
 
       - name: 校验产物
         run: |
-          ls -lh dist/
-          mkdir -p /tmp/vfy
-          diskutil image attach dist/YunShuSwitch.dmg --mountPoint /tmp/vfy --mountOptions nobrowse
-          ls -la /tmp/vfy/
-          hdiutil detach /tmp/vfy
+          MOUNT=$(hdiutil attach dist/YunShuSwitch.dmg -readonly -nobrowse | awk -F'\t' 'END{print $NF}')
+          ls -la "$MOUNT"
+          test -x "$MOUNT/云枢开关.app/Contents/MacOS/YunshuSwitch"
+          hdiutil detach "$MOUNT"
 
       - name: 上传 DMG
         uses: actions/upload-artifact@v4

@@ -68,7 +68,15 @@ rm -f "$RW"
 hdiutil create -size 40m -fs HFS+ -volname "$VOL" "$RW" >/dev/null
 
 echo "▶ 挂载并拷入"
-diskutil image attach "$RW" --mountPoint "$MNT" --mountOptions nobrowse >/dev/null
+if ! diskutil image attach "$RW" --mountPoint "$MNT" --mountOptions nobrowse >/dev/null 2>&1; then
+  # 无图形会话的环境（CI、SSH 远程）偶尔挂载不了，退化成直接打包：功能完整，只是没有背景排版
+  echo "  ⚠️ 无法挂载可写镜像，改用直接打包（无背景图/图标坐标）"
+  rm -f "$RW"
+  hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "${DMG%.dmg}-tmp.dmg" >/dev/null
+  mv -f "${DMG%.dmg}-tmp.dmg" "$DMG"
+  echo "✅ 完成：$DMG（$(du -h "$DMG" | cut -f1)，版本 $VERSION）"
+  exit 0
+fi
 trap "hdiutil detach '$MNT' -force >/dev/null 2>&1 || true" EXIT
 cp -R "$STAGE/." "$MNT/"
 
