@@ -1,0 +1,17 @@
+{
+  "CFBundleDevelopmentRegion" = "zh_CN";
+  "CFBundleExecutable" = "YunshuSwitch";
+  "CFBundleIconFile" = "AppIcon";
+  "CFBundleIdentifier" = "com.shiwuhao.yunshuswitch";
+  "CFBundleInfoDictionaryVersion" = "6.0";
+  "CFBundleName" = "云枢开关";
+  "CFBundleDisplayName" = "云枢开关";
+  "CFBundlePackageType" = "APPL";
+  "CFBundleShortVersionString" = "1.3.0";
+  "CFBundleVersion" = "130";
+  "LSMinimumSystemVersion" = "13.0";
+  "LSUIElement" = true;
+  "NSHighResolutionCapable" = true;
+  "NSAppleEventsUsageDescription" = "用于在云枢界面中点击“连接/断开”按钮。";
+  "NSSystemAdministrationUsageDescription" = "用于启用或禁用云枢的系统守护进程。";
+}

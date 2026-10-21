@@ -1,0 +1,13 @@
+# 构建产物（源码构建会重新生成本目录）
+build/
+
+# 打包 .DS_Store 用的 Python 虚拟环境
+.venv-artwork/
+
+# macOS 目录元数据
+.DS_Store
+
+# 镜像中间产物；只保留 dist/ 下的最终发布盘
+*.dmg
+!dist/*.dmg
+dist/*-new.dmg

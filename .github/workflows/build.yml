@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 编译 App 与安装盘
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          xcode-select -p
+          xcrun swiftc --version
+
+      - name: 编译菜单栏 App
+        run: ./build.sh
+
+      - name: 打包 DMG
+        run: |
+          # .DS_Store 排版需要 ds_store；装不上也不影响（脚本会跳过美化）
+          python3 -m pip install --user --quiet ds_store mac_alias || true
+          ./make-dmg.sh
+
+      - name: 校验产物
+        run: |
+          ls -lh dist/
+          mkdir -p /tmp/vfy
+          diskutil image attach dist/YunShuSwitch.dmg --mountPoint /tmp/vfy --mountOptions nobrowse
+          ls -la /tmp/vfy/
+          hdiutil detach /tmp/vfy
+
+      - name: 上传 DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: YunShuSwitch-dmg
+          path: dist/YunShuSwitch.dmg
+          if-no-files-found: error
+
+      - name: 附加到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/YunShuSwitch.dmg
+          generate_release_notes: true

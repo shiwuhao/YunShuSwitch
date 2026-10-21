@@ -1,0 +1,1045 @@
+#!/bin/zsh
+# ysctl — 云枢（Yunshu / eagleyun SASE）一键连接 / 一键彻底停用
+#
+#   ysctl up        启动全部组件并连接企业内网
+#   ysctl down      断开连接 → 退出程序 → 禁用守护进程
+#   ysctl toggle    已连接则 down，否则 up
+#   ysctl status    查看当前状态
+#   ysctl state     只输出一个词：connected / idle / off
+#   ysctl doctor    环境自检（路径、权限、辅助功能）
+#   ysctl ui-dump   打印云枢界面的可访问性树（调试用）
+#
+# 适配：macOS 27 / Apple Silicon (arm64)，云枢 2.6.1 实测结构
+# 版本：1.2.0
+
+emulate -L zsh
+zmodload zsh/datetime 2>/dev/null   # EPOCHREALTIME / strftime，用于计时与日志
+setopt no_unset
+unsetopt pipe_fail 2>/dev/null
+
+VERSION="1.3.0"
+
+# ── 云枢固定结构（如后续版本变动，改这里即可） ─────────────────────────
+UI_APP="/Applications/Yunshu.app"
+UI_BUNDLE="com.eagleyun.sase"
+AGENT_LABEL="com.eagleyun.endpoint.agent"
+AGENT_PLIST="/Library/LaunchAgents/com.eagleyun.endpoint.agent.plist"
+MGR_LABEL="com.eagleyun.sase.servicemanager"
+MGR_PLIST="/Library/LaunchDaemons/com.eagleyun.sase.servicemanager.plist"
+HELPER_LABEL="com.eagleyun.sase.helper"
+HELPER_PLIST="/Library/LaunchDaemons/com.eagleyun.sase.helper.plist"
+
+# 免密提权助手（ysctl setup 安装，用来免除每次的密码框）
+PRIV_PATH="/usr/local/sbin/yunshu-priv"
+SUDOERS_FILE="/etc/sudoers.d/yunshu-switch"
+
+APP_BUNDLE_ID="com.shiwuhao.yunshuswitch"
+APP_CANDIDATES=("$HOME/Applications/云枢开关.app" "/Applications/云枢开关.app" \
+                "$HOME/Applications/YunshuSwitch.app" "/Applications/YunshuSwitch.app")
+AX_STATUS_FILE=""   # 在 STATE_DIR 定义后赋值
+
+LOG_DIR="$HOME/Library/Logs/YunshuSwitch"
+STATE_DIR="$HOME/Library/Application Support/YunshuSwitch"
+LOG_FILE="$LOG_DIR/ysctl.log"
+AX_STATUS_FILE="$STATE_DIR/ax.status"
+
+SELF="${0:A}"
+SHARE_DIR="${SELF:h}"
+UI_SCRIPT="$SHARE_DIR/ui.applescript"
+[[ -f $UI_SCRIPT ]] || UI_SCRIPT="$SHARE_DIR/../lib/ui.applescript"   # 开发目录布局
+
+FORCE=0
+QUIET=0
+
+# ── 输出 ────────────────────────────────────────────────────────────────
+# 日志时间戳用 zsh 内建 strftime，不再 fork 一个 date（每次省 5~8ms，一次命令里几十次）
+_log() {
+  print -r -- "$*"
+  [[ -d $LOG_DIR ]] && print -r -- "$(strftime '%Y-%m-%d %H:%M:%S' ${EPOCHSECONDS:-0}) $*" >> "$LOG_FILE"
+}
+info() { (( QUIET )) || print -r -- "  $*"; _log "INFO  $*" >/dev/null 2>&1 }
+ok()   { (( QUIET )) || print -r -- "  ✅ $*"; _log "OK    $*" >/dev/null 2>&1 }
+warn() { print -r -- "  ⚠️  $*" >&2; _log "WARN  $*" >/dev/null 2>&1 }
+err()  { print -r -- "  ❌ $*" >&2; _log "ERROR $*" >/dev/null 2>&1 }
+# 计时基准：每个 step 都会在日志里带 (+Xs)，方便定位慢在哪一步
+T0=${EPOCHREALTIME:-0}
+
+step() {
+  (( QUIET )) || { print -r -- ""; print -r -- "▶ $*" }
+  local el=""
+  (( T0 > 0 )) && el=$(printf ' (+%.1fs)' $(( ${EPOCHREALTIME:-$T0} - T0 )))
+  _log "STEP  $*$el" >/dev/null 2>&1
+}
+
+# ── 免密提权助手 ────────────────────────────────────────────────────────
+# 一次性装好一个受限 root 脚本 + sudoers NOPASSWD 规则，
+# 之后 up / down 通过 `sudo -n` 调用它，不再弹密码框。
+priv_installed() { [[ -x $PRIV_PATH && -f $SUDOERS_FILE ]] }
+
+# 系统里的助手是否落后于随包发布的版本（改了逻辑又没 setup 时会命中）
+priv_stale() {
+  [[ -x $PRIV_PATH ]] || return 1
+  local src="$SHARE_DIR/yunshu-priv"
+  [[ -f $src ]] || src="$SHARE_DIR/../lib/yunshu-priv"
+  [[ -f $src ]] || return 1
+  ! cmp -s "$PRIV_PATH" "$src"
+}
+
+typeset -g _priv_ok="" _priv_why="" _priv_err=""
+typeset -g _self_heal_done=0     # 每次执行最多自愈一次，避免反复弹框
+priv_ready() {   # 结果在单次执行内缓存，避免反复起 sudo 进程
+  if [[ -z $_priv_ok ]]; then
+    if ! priv_installed; then
+      _priv_ok=0; _priv_why="missing"
+    else
+      _priv_err=$(sudo -n "$PRIV_PATH" check 2>&1)
+      if (( $? == 0 )); then
+        _priv_ok=1; _priv_why=""; _priv_err=""
+      else
+        _priv_ok=0; _priv_why="denied"     # 文件在，但 sudo 不认这条免密规则
+      fi
+    fi
+    # 留一条痕迹：事后能确认这次到底走的是免密还是密码框
+    _log "PRIV  ok=${_priv_ok} why=${_priv_why:--}${_priv_err:+ err=${_priv_err%%$'\n'*}}" >/dev/null 2>&1
+  fi
+  [[ $_priv_ok == 1 ]]
+}
+
+# 缓存失效（setup 之后必须调用，否则同一次执行里还会记得旧的失败结果）
+priv_reset() { _priv_ok=""; _priv_why=""; _priv_err=""; }
+
+# 返回 0 = 免密助手执行成功；1 = 助手不可用（调用方才回退到密码框）
+# 注意：助手**执行了但返回非 0** 时不算"不可用"，必须把真实结果交给调用方，
+# 否则会出现「明明已经执行了，却又弹一次密码框」的怪象。
+priv_run() {  # $1 = up|down
+  local a="${1:-}" out rc
+  [[ -n $a ]] || return 1
+  priv_ready || return 1
+  out=$(sudo -n "$PRIV_PATH" "$a" 2>&1); rc=$?
+  if (( rc != 0 )) && [[ $out == sudo:* || $out == *"command not found"* ]]; then
+    _priv_ok=0; _priv_why="denied"; _priv_err=$out     # sudo 本身没跑起来 → 允许回退
+    _log "PRIV  $a sudo-failed: ${out%%$'\n'*}" >/dev/null 2>&1
+    return 1
+  fi
+  _log "PRIV  $a rc=$rc" >/dev/null 2>&1
+  print -r -- "$out"
+  return $rc
+}
+
+# ── 提权执行：把一段 root 脚本交给 sudo / 系统密码框执行 ─────────────────
+# 优先用免密助手（$1 = up|down）；没装助手时退回 sudo 缓存或 macOS 原生授权框
+run_admin() {
+  emulate -L zsh
+  local action="${1:-}"
+
+  # 免密助手可用时：它执行了就算数（成功/失败都如实返回），绝不再弹密码框。
+  # 老版本这里写成 `priv_run || 回退`，助手返回非 0 时会重复弹框，
+  # 而且 up 因此被判失败、直接中止在后面「点连接」之前 —— 就是"一键连接不连"的元凶。
+  if [[ -n $action ]] && priv_ready; then
+    local rrc=0
+    priv_run "$action"; rrc=$?
+    if (( rrc != 0 )); then
+      warn "免密助手已执行 $action，但返回码 $rrc（这是真实结果，不再弹密码框）"
+    fi
+    return $rrc
+  fi
+
+  local body tmp rc=0
+  body="$(cat)"
+  mkdir -p "$STATE_DIR"
+  tmp="$(mktemp "$STATE_DIR/root.XXXXXX")"
+  print -r -- "$body" > "$tmp"
+  chmod 700 "$tmp"
+
+  # 自愈：规则文件在、但 sudo 不认（多半是旧版规则少写了 up/down 两条），
+  # 先把规则重写一遍再重试 —— 这样只需要输一次密码，而不是每次 up/down 都输。
+  if [[ -n $action && $_self_heal_done == 0 && $_priv_why == denied && -x $PRIV_PATH ]]; then
+    _self_heal_done=1
+    warn "免密规则没生效，正在自动重写（这次输一次密码，之后不再弹）"
+    if cmd_setup --force >/dev/null 2>&1; then
+      priv_reset
+      if priv_ready; then
+        local hrc=0
+        priv_run "$action"; hrc=$?
+        rm -f "$tmp"
+        return $hrc
+      fi
+    fi
+    warn "自动重写没成功，本次仍用系统密码框（可手动执行 ysctl fix 排查）"
+  fi
+
+  if (( EUID == 0 )); then
+    /bin/zsh "$tmp"; rc=$?
+  elif sudo -n true 2>/dev/null; then
+    sudo /bin/zsh "$tmp"; rc=$?
+  else
+    # 走到这里说明免密没生效，下面会用系统密码框——先把原因写清楚，别让用户瞎猜
+    _log "ADMIN fallback to password box (why=${_priv_why:-unknown})" >/dev/null 2>&1
+    if [[ -n $action ]]; then
+      case $_priv_why in
+        missing)
+          info "免密助手未安装：这次要用密码框。执行 ysctl setup 可一次性解决" ;;
+        denied)
+          if [[ -x $PRIV_PATH ]]; then
+            info "免密规则没被 sudo 接受，这次要用密码框（ysctl fix 可修复）"
+            [[ -n $_priv_err ]] && info "  sudo 说：${_priv_err%%$'\n'*}"
+          else
+            info "免密助手文件缺失，这次要用密码框（ysctl fix 可修复）"
+          fi ;;
+        *)
+          info "这次需要用管理员密码" ;;
+      esac
+    fi
+    local out
+    out=$(osascript -e "do shell script \"/bin/zsh '${tmp}'\" with administrator privileges" 2>&1); rc=$?
+    print -r -- "$out"
+    if (( rc != 0 )) && [[ $out == *canceled* || $out == *取消* ]]; then
+      err "已取消管理员授权"
+    fi
+  fi
+  rm -f "$tmp"
+  return $rc
+}
+
+# ── 状态探测 ────────────────────────────────────────────────────────────
+# 云枢隧道特征：点对点 utun 上有一条 inet 地址，且大量路由的网关 == 该地址
+# 返回 "iface ip 路由条数"
+# 性能：只跑 1 次 netstat（原来按 utun 接口数逐个跑，7 个接口 ≈ 1.6 秒）；
+#       再加 0.6 秒结果缓存 —— 一次 up/down 里会查 4~6 次，命中缓存就不再 fork netstat+awk
+typeset -g _ti_out="" _ti_ok=0 _ti_t=0
+tunnel_info() {
+  local now=${EPOCHREALTIME:-0}
+  if (( _ti_t > 0 )) && (( now - _ti_t < 0.6 )); then
+    if (( _ti_ok )); then print -r -- "$_ti_out"; return 0; fi
+    return 1
+  fi
+  local out
+  out=$(netstat -rn -f inet 2>/dev/null | awk '
+    $NF ~ /^utun/ { c[$NF " " $2]++ }
+    END {
+      best = ""; n = 0
+      for (k in c) if (c[k] > n) { n = c[k]; best = k }
+      if (n >= 5) print best, n
+    }')
+  _ti_t=${EPOCHREALTIME:-0}
+  if [[ -z $out ]]; then
+    _ti_ok=0; _ti_out=""
+    return 1
+  fi
+  _ti_ok=1; _ti_out=$out
+  print -r -- "$out"
+}
+
+# 轮询专用：跳过缓存，拿真实值
+tunnel_fresh() { _ti_t=0; tunnel_info }
+
+ys_pids() {
+  pgrep -fl -i 'YunshuAgent|YunshuManager|YunshuPluginService|com\.eagleyun\.sase\.helper|/opt/\.yunshu/|/Applications/Yunshu\.app/Contents/MacOS' 2>/dev/null
+}
+
+no_yunshu_pids() { [[ -z $(ys_pids) ]] }
+
+job_state() {  # $1 = domain/label
+  local out
+  out=$(launchctl print "$1" 2>/dev/null) || { print "unloaded"; return }
+  print -r -- "$out" | awk '/^[[:space:]]*state = /{print $3; exit}'
+}
+
+agent_running() { [[ $(job_state "gui/$UID/$AGENT_LABEL") == running ]] }
+
+typeset -g _disabled_sys=""
+job_disabled() {  # $1 = gui|system , $2 = label
+  local dom="$1" lbl="$2" dump
+  if [[ $dom == system ]]; then
+    [[ -z $_disabled_sys ]] && _disabled_sys=$(launchctl print-disabled system 2>/dev/null)
+    dump=$_disabled_sys
+  else
+    dump=$(launchctl print-disabled "$dom" 2>/dev/null)
+  fi
+  [[ $dump == *"\"$lbl\" => disabled"* ]]
+}
+
+ui_running() { pgrep -x Yunshu >/dev/null 2>&1 }
+
+# ── 界面自动化：交给已授权的菜单栏 App 执行 ─────────────────────────────
+# ysctl 自身不需要任何系统权限；真正点按钮的是 YunshuSwitch.app（只授权它一次）
+app_path() {
+  local c
+  if [[ -f "$STATE_DIR/app.path" ]]; then
+    c=$(<"$STATE_DIR/app.path")
+    [[ -d $c ]] && { print -r -- "$c"; return 0 }
+  fi
+  for c in "${APP_CANDIDATES[@]}"; do
+    [[ -d $c ]] && { print -r -- "$c"; return 0 }
+  done
+  [[ -d "$SHARE_DIR/../build/YunshuSwitch.app" ]] && { print -r -- "$SHARE_DIR/../build/YunshuSwitch.app"; return 0 }
+  return 1
+}
+
+# 用可执行文件名匹配，不依赖 .app 目录名（安装后目录名是「云枢开关.app」）
+app_running() { pgrep -f 'Contents/MacOS/YunshuSwitch' >/dev/null 2>&1 }
+
+# 启动菜单栏 App：先按路径，再按 bundle id（App 被移动过也能找到）
+app_launch() {
+  local p
+  if p=$(app_path); then
+    open -a "$p" >/dev/null 2>&1 && return 0
+  fi
+  open -b "$APP_BUNDLE_ID" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+ax_ensure_app() {
+  app_running && return 0
+  app_launch || return 1
+  _log "UI  App 未运行，已发起启动请求" >/dev/null 2>&1
+  local i
+  for i in {1..120}; do           # 最长约 12 秒：首次启动要过 Gatekeeper，不能只等 6 秒
+    app_running && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# 通过请求文件与 App 通信（App 每 0.2 秒轮询一次）
+ax_call() {  # $1 = connect|disconnect|dump|trust
+  local cmd="$1" nonce="$$.${RANDOM}${RANDOM}"
+  local req="$STATE_DIR/ax.request" res="$STATE_DIR/ax.response"
+  mkdir -p "$STATE_DIR"
+  ax_ensure_app || { print -r -- "NOAPP"; return 1 }
+  rm -f "$res"
+  { print -r -- "$nonce"; print -r -- "$cmd" } > "$req.tmp" 2>/dev/null || { print -r -- "NOAPP"; return 1 }
+  mv -f "$req.tmp" "$req" 2>/dev/null || { print -r -- "NOAPP"; return 1 }
+
+  local i body
+  for i in {1..300}; do            # 最长 30 秒
+    if [[ -f $res ]]; then
+      body=$(<"$res")
+      if [[ ${body%%$'\n'*} == $nonce ]]; then
+        rm -f "$res"
+        print -r -- "${body#*$'\n'}"
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  rm -f "$req"
+  print -r -- "TIMEOUT"
+  return 1
+}
+
+# 返回：OK / NOUI / NOAX / NOBTN / NOAPP / ERR:...
+ui_action() {  # $1 = connect|disconnect|dump
+  local act="$1" out
+  if app_running || app_path >/dev/null; then
+    out=$(ax_call "$act")
+    _log "UI  $act -> ${out%%$'\n'*}" >/dev/null 2>&1
+    print -r -- "$out"
+    return 0
+  fi
+  # 退路：老式 osascript（需要给终端或 /usr/bin/osascript 授权，一般不推荐）
+  [[ -f $UI_SCRIPT ]] || { print -r -- "NOSCRIPT"; return 1 }
+  out=$(osascript "$UI_SCRIPT" "$act" 2>&1) || { print -r -- "ERR:$out"; return 1 }
+  print -r -- "$out"
+}
+
+# 只读状态文件，不启动 App（供 status 使用）
+ui_ax_ok() {
+  [[ -f $AX_STATUS_FILE ]] || return 1
+  local s
+  s=$(<"$AX_STATUS_FILE")
+  [[ ${s%%$'\n'*} == trusted ]]
+}
+
+ui_ax_known() { [[ -f $AX_STATUS_FILE ]] }
+
+# 等待隧道出现/消失：按墙钟截止时间轮询（每次 netstat 约 0.1 秒，不能按轮数算秒）
+wait_tunnel() {  # $1 = 最多等几秒
+  local dl=$(( ${EPOCHREALTIME:-0} + ${1:-10} ))
+  while (( ${EPOCHREALTIME:-0} < dl )); do
+    tunnel_fresh >/dev/null && return 0
+    sleep 0.15
+  done
+  return 1
+}
+
+wait_no_tunnel() {  # $1 = 最多等几秒
+  local dl=$(( ${EPOCHREALTIME:-0} + ${1:-10} ))
+  while (( ${EPOCHREALTIME:-0} < dl )); do
+    tunnel_fresh >/dev/null || return 0
+    sleep 0.15
+  done
+  return 1
+}
+
+# 轮询等待某个条件成立（墙钟语义）：$1 = 判定命令，$2 = 秒，$3 = 间隔
+wait_until() {
+  local cond="$1" dl=$(( ${EPOCHREALTIME:-0} + ${2:-3} )) iv="${3:-0.05}"
+  while (( ${EPOCHREALTIME:-0} < dl )); do
+    "$cond" && return 0
+    sleep $iv
+  done
+  "$cond"
+}
+
+# 会被提权执行的 root 脚本（单独成函数，方便 debug-script 做语法校验）
+root_script_up() {
+  cat <<EOF
+#!/bin/zsh
+set -u
+# 已安装受限助手时直接复用它（只有一份实现）
+if [[ -x /usr/local/sbin/yunshu-priv ]]; then
+  exec /usr/local/sbin/yunshu-priv up
+fi
+launchctl enable system/${MGR_LABEL}
+launchctl enable system/${HELPER_LABEL}
+launchctl bootstrap system "${MGR_PLIST}"    2>/dev/null || true
+launchctl bootstrap system "${HELPER_PLIST}" 2>/dev/null || true
+sleep 0.4
+rc=0
+for L in ${MGR_LABEL} ${HELPER_LABEL}; do
+  if ! launchctl print system/\$L >/dev/null 2>&1; then
+    launchctl kickstart system/\$L 2>/dev/null || true
+    sleep 0.3
+  fi
+  if launchctl print system/\$L >/dev/null 2>&1; then
+    echo "  started: \$L"
+  else
+    echo "  FAILED : \$L" >&2
+    rc=1
+  fi
+done
+exit \$rc
+EOF
+}
+
+root_script_down() {
+  cat <<EOF
+#!/bin/zsh
+set -u
+# 已安装受限助手时直接复用它（保证只有一份实现，行为一致）
+if [[ -x /usr/local/sbin/yunshu-priv ]]; then
+  exec /usr/local/sbin/yunshu-priv down
+fi
+launchctl bootout system/${MGR_LABEL}    2>/dev/null || true
+launchctl bootout system/${HELPER_LABEL} 2>/dev/null || true
+sleep 1
+launchctl disable system/${MGR_LABEL}
+launchctl disable system/${HELPER_LABEL}
+# KeepAlive 任务可能再拉起一轮子进程，多杀几轮
+for i in 1 2 3 4; do
+  pkill -f '/opt/\.yunshu/' 2>/dev/null || true
+  pkill -f 'com\.eagleyun\.sase\.helper' 2>/dev/null || true
+  sleep 0.6
+  pgrep -f '/opt/\.yunshu/|com\.eagleyun\.sase\.helper' >/dev/null 2>&1 || break
+done
+echo "  daemons stopped & disabled"
+EOF
+}
+
+root_script_setup() {  # $1 = yunshu-priv 源文件，$2 = 用户名
+  local src="$1" user="$2"
+  cat <<EOF
+#!/bin/zsh
+set -u
+umask 022
+/bin/mkdir -p /usr/local/sbin
+/usr/bin/install -o root -g wheel -m 0755 '${src}' ${PRIV_PATH}
+/bin/cat > ${SUDOERS_FILE} <<'SUDOERS_EOF'
+# 由 ysctl setup 生成，ysctl unsetup 删除
+# 仅放行云枢守护进程的启停，不接受其它命令或参数
+${user} ALL=(root) NOPASSWD: ${PRIV_PATH} check, ${PRIV_PATH} up, ${PRIV_PATH} down
+SUDOERS_EOF
+/usr/sbin/chown root:wheel ${SUDOERS_FILE} 2>/dev/null || /usr/bin/chown root:wheel ${SUDOERS_FILE}
+/bin/chmod 0440 ${SUDOERS_FILE}
+if /usr/sbin/visudo -c -f ${SUDOERS_FILE} >/dev/null 2>&1; then
+  /bin/echo "  sudoers 语法校验通过"
+else
+  /bin/rm -f ${SUDOERS_FILE}
+  /bin/echo "  sudoers 语法校验失败，已回滚" >&2
+  exit 1
+fi
+/bin/echo "  已安装 ${PRIV_PATH}"
+EOF
+}
+
+root_script_unsetup() {
+  cat <<EOF
+#!/bin/zsh
+set -u
+/bin/rm -f ${PRIV_PATH} ${SUDOERS_FILE}
+if [[ -z "\$(/bin/ls -A /usr/local/sbin 2>/dev/null)" ]]; then
+  /bin/rmdir /usr/local/sbin 2>/dev/null || true
+fi
+/bin/echo "  removed"
+EOF
+}
+
+# ── 退出云枢主程序 ─────────────────────────────────────────────────────
+# 不用 Apple Events（需「自动化」权限，未授权时报 -10004），直接发 TERM
+quit_ui() {
+  local i
+  ui_running || return 0
+  pkill -TERM -f '/Applications/Yunshu.app/Contents/MacOS/Yunshu' 2>/dev/null
+  for i in {1..40}; do ui_running || return 0; sleep 0.1; done
+  pkill -KILL -f '/Applications/Yunshu.app/Contents/MacOS/Yunshu' 2>/dev/null
+  for i in {1..15}; do ui_running || return 0; sleep 0.1; done
+  return 1
+}
+
+# 系统守护进程是否已经停掉并且处于禁用状态（重复 down 时用来跳过提权）
+daemons_stopped() {
+  [[ $(job_state "system/$MGR_LABEL") == unloaded ]] || return 1
+  [[ $(job_state "system/$HELPER_LABEL") == unloaded ]] || return 1
+  job_disabled system $MGR_LABEL  || return 1
+  job_disabled system $HELPER_LABEL || return 1
+  return 0
+}
+
+daemons_ready() {
+  [[ $(job_state "system/$MGR_LABEL") == running ]] || return 1
+  [[ $(job_state "system/$HELPER_LABEL") == running ]] || return 1
+  job_disabled system $MGR_LABEL && return 1
+  job_disabled system $HELPER_LABEL && return 1
+  return 0
+}
+
+# ── up ─────────────────────────────────────────────────────────────────
+cmd_up() {
+  if [[ ! -d $UI_APP ]]; then
+    err "未找到 $UI_APP，云枢可能未安装"
+    return 1
+  fi
+
+  if tunnel_info >/dev/null; then
+    ok "内网已处于连接状态，无需操作"
+    return 0
+  fi
+
+  if priv_stale; then
+    info "提示：系统里的免密助手是旧版，守护进程启动会多花约 10 秒"
+    info "      执行 ysctl setup --force 可更新（只需一次密码）"
+  fi
+
+  # 顺序不能乱：云枢主程序必须在两个守护进程 + 用户级代理起来之后再启动。
+  # 实测「先起云枢、后起服务」时，点「连接网络」会变成静默空操作（菜单不报错，
+  # 但隧道永远不建立），必须重启主程序或再点一次才生效 —— 所以这里保持串行。
+  step "1/4 系统守护进程"
+  if daemons_ready; then
+    ok "守护进程已在运行，跳过提权"
+  else
+    if priv_ready; then
+      info "通过免密助手启用并启动守护进程"
+    else
+      info "需要管理员授权，用于启用并启动守护进程"
+      info "（执行 ysctl setup 可改为免密，只需输一次密码）"
+    fi
+    run_admin up <<< "$(root_script_up)" || {
+      if daemons_ready; then
+        warn "助手返回了非 0，但守护进程其实已经起来了，继续"
+      else
+        err "守护进程启动失败"; return 1
+      fi
+    }
+    ok "系统守护进程已启动"
+  fi
+
+  step "2/4 用户级代理"
+  launchctl enable "gui/$UID/$AGENT_LABEL" 2>/dev/null
+  local st
+  st=$(job_state "gui/$UID/$AGENT_LABEL")
+  if [[ $st != running ]]; then
+    launchctl bootstrap "gui/$UID" "$AGENT_PLIST" 2>/dev/null || true
+    wait_until agent_running 3
+    st=$(job_state "gui/$UID/$AGENT_LABEL")
+  fi
+  if [[ $st != running ]]; then
+    launchctl kickstart "gui/$UID/$AGENT_LABEL" 2>/dev/null || true
+    wait_until agent_running 3
+    st=$(job_state "gui/$UID/$AGENT_LABEL")
+  fi
+  if [[ $st == running ]]; then
+    ok "YunshuAgent 已运行"
+  else
+    warn "YunshuAgent 未进入 running 状态（可在 status 中复查）"
+  fi
+
+  step "3/4 启动云枢主程序"
+  if ui_running; then
+    info "主程序已在运行"
+  else
+    open -a "$UI_APP" 2>/dev/null || { err "无法打开云枢"; return 1; }
+    wait_until ui_running 6 || { err "主程序未能启动"; return 1; }
+    ok "主程序已启动"
+  fi
+
+  if tunnel_info >/dev/null; then
+    ok "内网隧道已建立，无需点击"
+    _report_connected
+    return 0
+  fi
+
+  step "4/4 触发“连接”"
+  # 最多点 3 次：冷启动时云枢自己还没接上本地服务，第一次点击可能被静默忽略，
+  # 这时隧道不会出现，再点一次即可（实测第二次必中）。
+  local attempt=1 r
+  while (( attempt <= 3 )); do
+    r=$(ui_action connect)
+    case "$r" in
+      OK)
+        info "已在云枢界面点击连接，等待隧道建立…" ;;
+      NOAX)
+        err "缺少「辅助功能」权限，无法自动点击"
+        info "处理办法（推荐第一种，只需做一次）："
+        info "  1. 打开菜单栏的「云枢开关」→ 点「连接内网」，会弹出授权引导"
+        info "  2. 或执行 ysctl ax 直接打开系统设置面板"
+        info "  3. 或在云枢界面手动点一下「立即连接」"
+        break ;;
+      NOAPP)
+        warn "菜单栏 App 没在运行，且自动拉起失败，无法替你点按钮"
+        info "处理办法："
+        info "  1. 打开「应用」里的 YunshuSwitch，或执行 open -b $APP_BUNDLE_ID"
+        info "  2. 或直接点菜单栏云枢图标 → 连接网络"
+        info "  3. 若 App 已被删掉，在项目目录执行 ./install.sh 重装"
+        break ;;
+      NOUI)
+        warn "云枢界面未就绪，请手动点一下「立即连接」"
+        break ;;
+      NOBTN)
+        warn "没有找到连接按钮"
+        info "执行 ysctl ui-dump 导出界面元素后反馈，以便校正按钮匹配"
+        break ;;
+      TIMEOUT|ERR:*)
+        warn "界面操作超时或异常：$r"
+        break ;;
+      *)
+        warn "界面自动化异常：$r"
+        break ;;
+    esac
+
+    # 第一轮 12 秒（App 侧自己有 8 秒确认窗口 + 补点），之后每轮 8 秒
+    local budget=8
+    (( attempt == 1 )) && budget=12
+    if wait_tunnel $budget; then
+      ok "内网连接成功"
+      _report_connected
+      return 0
+    fi
+    if (( attempt < 3 )); then
+      warn "隧道还没出现，再点一次（第 $(( attempt + 1 )) 次尝试）"
+      sleep 1.5
+    fi
+    (( attempt++ ))
+  done
+
+  # 兜底：冷启动时云枢的本地服务可能还没接好，点击会被静默忽略（菜单不报错、
+  # 隧道不建立）。连着点都没用，就把主程序重启一次再点 —— 实测这样必中。
+  warn "点击多次仍未连上，重启云枢主程序后重试"
+  quit_ui >/dev/null 2>&1
+  sleep 0.5
+  open -a "$UI_APP" 2>/dev/null || { err "无法重新打开云枢"; return 1; }
+  wait_until ui_running 6 || { err "云枢主程序未能重启"; return 1; }
+  sleep 0.5          # 等界面把菜单栏图标建出来
+  r=$(ui_action connect)
+  if wait_tunnel 15; then
+    ok "重启后连接成功"
+    _report_connected
+    return 0
+  fi
+
+  warn "仍未检测到隧道"
+  case "$r" in
+    NOAX|NOAPP|NOBTN) info "界面自动化异常（$r），执行 ysctl ui-dump 可导出元素排查" ;;
+  esac
+  info "若云枢弹出了二次认证（短信/扫码），完成后再执行 ysctl status"
+  return 2
+}
+
+cmd_auto() {  # ysctl auto on|off|show —— 对照云枢「设置 → 自动连接内网」
+  local v="${1:-show}"
+  case "$v" in
+    on)   defaults write "$UI_BUNDLE" CONNECT -bool true;  ok "已开启「自动连接内网」" ;;
+    off)  defaults write "$UI_BUNDLE" CONNECT -bool false; ok "已关闭「自动连接内网」" ;;
+    show|*) print -r -- "CONNECT(自动连接内网) = $(defaults read "$UI_BUNDLE" CONNECT 2>/dev/null || print '未设置')" ;;
+  esac
+}
+
+_report_connected() {
+  local ti; ti=$(tunnel_info) || return 0
+  local iface ip cnt
+  iface=${ti%% *}; ti=${ti#* }; ip=${ti%% *}; cnt=${ti#* }
+  info "隧道：$iface  本地地址：$ip  下发路由：$cnt 条"
+}
+
+# ── down ───────────────────────────────────────────────────────────────
+cmd_down() {
+  local keep_autostart=1 assume_yes=0
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --with-autostart)  keep_autostart=0 ;;
+      --force)           FORCE=1 ;;
+      -y|--yes)          assume_yes=1 ;;
+    esac
+  done
+
+  if (( ! FORCE && ! assume_yes )) && [[ -t 0 ]]; then
+    print -n "即将断开内网、退出云枢并禁用其守护进程，继续？(y/N) "
+    local ans; read -r ans
+    [[ ${ans:l} == y* ]] || { info "已取消"; return 0; }
+  fi
+
+  step "1/5 断开内网连接"
+  if tunnel_info >/dev/null; then
+    local r; r=$(ui_action disconnect)
+    case "$r" in
+      OK)      info "已点击“断开连接”，等待隧道拆除…" ;;
+      NOAX)    warn "缺少「辅助功能」权限，跳过界面点击，直接终止隧道进程" ;;
+      NOAPP)   warn "未找到 YunshuSwitch.app，直接终止隧道进程" ;;
+      *)       warn "界面断开未生效（$r），直接终止隧道进程" ;;
+    esac
+    # 只等 1.5 秒：点中之后云枢通常 0.5~1 秒内拆完；万一没拆干净也不用等，
+    # 下一步退出主程序时 utun 会随进程一起消失（无需再串行等一遍）
+    if wait_no_tunnel 1.5; then
+      info "隧道已拆除"
+    else
+      info "界面断开仍在进行，下一步退出程序会一并拆掉"
+    fi
+  else
+    info "当前没有隧道，跳过"
+  fi
+
+  step "2/5 退出云枢主程序"
+  quit_ui && ok "主程序已退出" || warn "主程序仍在运行（后续会一并清理）"
+  if (( ! keep_autostart )); then
+    info "关闭云枢的开机自启动开关"
+    defaults write "$UI_BUNDLE" AUTOSTART -int 0 2>/dev/null
+  fi
+
+  if daemons_stopped; then
+    step "3/5 系统守护进程"
+    ok "已在停止 + 禁用状态，跳过提权"
+  else
+    if priv_ready; then
+      step "3/5 停止并禁用系统守护进程（免密）"
+    else
+      step "3/5 停止并禁用系统守护进程（需要管理员授权，ysctl setup 可免密）"
+    fi
+    run_admin down <<< "$(root_script_down)" || warn "守护进程停止过程中有错误"
+    ok "系统守护进程已停止并禁用"
+  fi
+
+  step "4/5 停止并禁用用户级代理"
+  launchctl bootout "gui/$UID/$AGENT_LABEL" 2>/dev/null || true
+  launchctl disable "gui/$UID/$AGENT_LABEL" 2>/dev/null
+  pkill -f 'YunshuPluginService' 2>/dev/null
+  ok "用户级代理已停止并禁用"
+
+  step "5/5 校验残留"
+  # 原来固定 sleep 1 再查；改成先查、有了才等，最多 1 秒（通常第一次就干净）
+  wait_until no_yunshu_pids 1 || true
+  local pids; pids=$(ys_pids)
+  if [[ -z $pids ]]; then
+    ok "没有云枢相关进程残留"
+  else
+    warn "仍有进程存在："; print -r -- "$pids" | while read -r l; do info "  $l"; done
+  fi
+  if tunnel_info >/dev/null; then
+    wait_no_tunnel 2 >/dev/null
+  fi
+  local ti
+  if ti=$(tunnel_info); then
+    warn "隧道仍在：$ti"
+  else
+    ok "隧道已拆除，内网路由已清除"
+  fi
+
+  if priv_stale; then
+    info "提示：系统里的免密助手是旧版，执行 ysctl setup --force 可更新（只需一次密码）"
+  fi
+
+  _log "DOWN 完成" >/dev/null 2>&1
+  if (( ! QUIET )); then
+    print -r -- ""
+    print -r -- "云枢已停用。执行 ysctl up 可一键恢复。"
+  fi
+}
+
+# ── status ─────────────────────────────────────────────────────────────
+cmd_status() {
+  print -r -- "云枢状态  (ysctl $VERSION)"
+  print -r -- "────────────────────────────────────────────"
+
+  local ti
+  if ti=$(tunnel_info); then
+    local iface ip cnt
+    iface=${ti%% *}; ti=${ti#* }; ip=${ti%% *}; cnt=${ti#* }
+    print -r -- "  内网：✅ 已连接   $iface  $ip  (${cnt} 条路由)"
+  else
+    print -r -- "  内网：⛔️ 未连接"
+  fi
+
+  local s
+  s=$(job_state "system/$MGR_LABEL")
+  print -r -- "  YunshuManager   : job=$s$(job_disabled system $MGR_LABEL && print '  · 已禁用')"
+  s=$(job_state "system/$HELPER_LABEL")
+  print -r -- "  特权助手 helper : job=$s$(job_disabled system $HELPER_LABEL && print '  · 已禁用')"
+  s=$(job_state "gui/$UID/$AGENT_LABEL")
+  print -r -- "  YunshuAgent     : job=$s$(job_disabled gui $AGENT_LABEL && print '  · 已禁用')"
+  print -r -- "  主程序 UI       : $(ui_running && print '运行中' || print '未运行')"
+
+  local auto; auto=$(defaults read "$UI_BUNDLE" AUTOSTART 2>/dev/null || print '?')
+  print -r -- "  开机自启开关    : $auto   (1=开, 0=关)"
+
+  local pids; pids=$(ys_pids)
+  if [[ -z $pids ]]; then
+    print -r -- "  进程            : 无"
+  else
+    print -r -- "  进程            :"
+    print -r -- "$pids" | while read -r pid cmd; do
+      print -r -- "      ${pid}  ${${cmd%% *}:t}"
+    done
+  fi
+
+  local appp
+  appp=$(app_path 2>/dev/null)
+  if ui_ax_ok; then
+    print -r -- "  自动点击权限    : ✅ 已授权（由菜单栏 App 执行）"
+  elif [[ -n $appp ]] && app_running; then
+    print -r -- "  自动点击权限    : ⚠️  未授权 → 执行 ysctl ax 授权后即可自动点按钮"
+  elif [[ -n $appp ]]; then
+    print -r -- "  自动点击权限    : ⚠️  未知（菜单栏 App 未运行，执行 ysctl up 会拉起）"
+  else
+    print -r -- "  自动点击权限    : ❌ 未安装 YunshuSwitch.app"
+  fi
+}
+
+cmd_state() {
+  if tunnel_info >/dev/null; then
+    print connected
+  elif [[ -n $(ys_pids) ]] || [[ $(job_state "system/$MGR_LABEL") == running ]]; then
+    print idle
+  else
+    print off
+  fi
+}
+
+# ── doctor ─────────────────────────────────────────────────────────────
+cmd_doctor() {
+  print -r -- "ysctl doctor — 环境自检"
+  print -r -- "────────────────────────────────────────────"
+  print -r -- "  macOS   : $(sw_vers -productVersion) ($(uname -m))"
+  print -r -- "  脚本    : $SELF"
+  print -r -- "  资源目录: $SHARE_DIR"
+  print -r -- "  云枢App : $([[ -d $UI_APP ]] && print 存在 || print 缺失)"
+  print -r -- "  Agent   : $([[ -f $AGENT_PLIST ]] && print 存在 || print 缺失)"
+  print -r -- "  Manager : $([[ -f $MGR_PLIST ]] && print 存在 || print 缺失)"
+  print -r -- "  Helper  : $([[ -f $HELPER_PLIST ]] && print 存在 || print 缺失)"
+  print -r -- "  UI脚本  : $([[ -f $UI_SCRIPT ]] && print 存在 || print 缺失)"
+  print -r -- "  日志    : $LOG_FILE"
+  print -r -- ""
+  if ui_ax_ok; then
+    print -r -- "  辅助功能：✅ 已授权（由菜单栏 App 执行点击）"
+  else
+    print -r -- "  辅助功能：⚠️ 未授权 → 自动点击连接/断开不可用"
+    print -r -- "            授权对象：$(app_path 2>/dev/null || print 'YunshuSwitch.app（未安装）')"
+    print -r -- "            执行 ysctl ax 打开授权面板"
+  fi
+  if priv_ready && priv_stale; then
+    print -r -- "  免密提权：✅ 已安装，但版本落后 → ysctl setup --force 更新"
+  elif priv_ready; then
+    print -r -- "  免密提权：✅ 已安装（up/down 不再输密码）"
+  elif priv_installed; then
+    print -r -- "  免密提权：⚠️  已安装，但当前 shell 无法执行 sudo -n"
+    print -r -- "            （受限 shell/沙箱里正常；请在普通终端复核，或 ysctl setup 重装）"
+  else
+    print -r -- "  免密提权：⚠️  未安装 → 每次 up/down 都要输密码"
+    print -r -- "            执行 ysctl setup 可一次性解决"
+  fi
+  local ti
+  ti=$(tunnel_info) && print -r -- "  隧道    : $ti" || print -r -- "  隧道    : 无"
+}
+
+cmd_ui_dump() {
+  local out
+  out=$(ui_action dump)
+  case "$out" in
+    NOAX)
+      err "缺少「辅助功能」权限（系统会报 -25211 / 不允许辅助访问）"
+      info "授权对象是菜单栏 App，不是终端："
+      print -r -- "     $(app_path 2>/dev/null || print '~/Applications/YunshuSwitch.app')"
+      info "执行 ysctl ax 可直接打开授权面板"
+      return 1 ;;
+    NOAPP)
+      err "未找到 YunshuSwitch.app"
+      info "在项目目录执行 ./install.sh 安装" ; return 1 ;;
+    NOUI)
+      err "云枢主程序没有在运行"; return 1 ;;
+    TIMEOUT)
+      err "界面读取超时"; return 1 ;;
+  esac
+  print -r -- "$out"
+  print -r -- ""
+  info "已输出 $(print -r -- "$out" | wc -l | tr -d ' ') 行"
+}
+
+cmd_setup() {
+  local force=0 a
+  for a in "$@"; do [[ $a == "--force" ]] && force=1; done
+  local user src="" c
+  user=$(id -un)
+  [[ $user =~ '^[A-Za-z0-9._-]+$' ]] || { err "用户名含特殊字符，无法安全写入 sudoers"; return 1; }
+
+  for c in "$SHARE_DIR/yunshu-priv" "$SHARE_DIR/../lib/yunshu-priv" "$SHARE_DIR/lib/yunshu-priv"; do
+    [[ -f $c ]] && { src="$c"; break }
+  done
+  [[ -n $src ]] || { err "找不到 yunshu-priv（应与 ysctl 放在同一目录）"; return 1; }
+
+  if priv_ready && (( ! force )); then
+    ok "免密助手已就绪，无需重复安装"
+    info "$PRIV_PATH"
+    info "$SUDOERS_FILE"
+    return 0
+  fi
+
+  priv_installed && warn "助手文件存在但 sudo 规则未生效，将重新安装"
+
+  step "安装免密助手（只有这一次需要输入管理员密码）"
+  info "将写入 $PRIV_PATH   （root:wheel 0755，只执行这一个脚本）"
+  info "将写入 $SUDOERS_FILE （只放行 check / up / down 三个动作）"
+  run_admin <<< "$(root_script_setup "$src" "$user")" || {
+    err "安装失败（已回滚，系统未被改动）"
+    return 1
+  }
+  priv_reset          # 关键：安装前那次探测的失败结果还缓存着，不清掉会误报
+
+  if priv_ready; then
+    ok "免密已生效：以后 ysctl up / down 不再弹密码框"
+    _log "SETUP 免密助手已安装" >/dev/null 2>&1
+    return 0
+  fi
+  if priv_installed; then
+    warn "文件已写入，但当前 shell 无法执行 sudo -n 复核"
+    [[ -n $_priv_err ]] && info "  sudo 说：${_priv_err%%$'\n'*}"
+    info "请在一个普通的「终端」窗口里执行：ysctl doctor"
+  else
+    err "安装未落盘，请运行 ysctl doctor 查看"
+  fi
+  return 1
+}
+
+# 一键修复：把「要密码」和「点不动」这两类装配问题一次处理干净
+cmd_fix() {
+  print -r -- "ysctl fix — 一键修复"
+  print -r -- "────────────────────────────────────────────"
+
+  step "1/3 重写免密助手"
+  cmd_setup --force || warn "免密助手安装未完成，见上面的提示"
+
+  step "2/3 辅助功能授权"
+  if ui_ax_ok; then
+    ok "菜单栏 App 已获得授权"
+  else
+    warn "辅助功能未授权 → 自动点击不可用"
+    info "稍后会打开系统设置，请勾选「云枢开关」"
+    cmd_ax >/dev/null 2>&1 || true
+  fi
+
+  step "3/3 环境自检"
+  cmd_doctor
+}
+
+cmd_unsetup() {
+  step "移除免密助手"
+  if ! priv_installed; then
+    info "未安装，无需移除"
+    return 0
+  fi
+  run_admin <<< "$(root_script_unsetup)" || { err "移除失败"; return 1; }
+  ok "已移除（之后 up / down 会重新要求输入密码）"
+  _log "UNSETUP 免密助手已移除" >/dev/null 2>&1
+}
+
+cmd_ax() {
+  local p
+  p=$(app_path 2>/dev/null)
+  print -r -- "辅助功能授权"
+  print -r -- "────────────────────────────────────────────"
+  if [[ -z $p ]]; then
+    err "未找到 YunshuSwitch.app，请先执行 ./install.sh"
+    return 1
+  fi
+  print -r -- "  授权对象：$p"
+  print -r -- "  （不是终端、也不是 /usr/bin/osascript —— 界面操作由这个 App 自己完成）"
+  print -r -- ""
+  print -r -- "  步骤："
+  print -r -- "    1. 面板打开后点左下角「+」"
+  print -r -- "    2. 按 ⇧⌘G，粘贴下面这行路径，回车"
+  print -r -- "    3. 选中 YunshuSwitch，打开开关"
+  print -r -- ""
+  print -r -- "    $p"
+  print -r -- ""
+  ui_ax_ok && ok "当前状态：已授权" || warn "当前状态：未授权"
+  open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null && \
+    info "已打开「系统设置 → 隐私与安全性 → 辅助功能」"
+}
+
+cmd_debug_script() {  # 打印将要提权执行的 root 脚本，便于审阅 / 语法校验
+  local what="${1:-up}"
+  local src="$SHARE_DIR/yunshu-priv"
+  [[ -f $src ]] || src="$SHARE_DIR/../lib/yunshu-priv"
+  case "$what" in
+    down)    root_script_down ;;
+    setup)   root_script_setup "$src" "$(id -un)" ;;
+    unsetup) root_script_unsetup ;;
+    *)       root_script_up ;;
+  esac
+}
+
+cmd_toggle() {
+  if tunnel_info >/dev/null; then cmd_down "$@"; else cmd_up "$@"; fi
+}
+
+usage() {
+  cat <<'USAGE'
+ysctl — 云枢一键开关
+
+  ysctl up               启动守护进程 + 主程序，并连接内网
+  ysctl down [-y] [--force] [--with-autostart]
+                         断开 → 退出 → 禁用全部守护进程
+                         -y / --force 跳过「继续？」确认，适合做别名或快捷键
+  ysctl toggle           已连接则断开，否则连接
+  ysctl status           查看详细状态
+  ysctl state            仅输出 connected / idle / off
+  ysctl auto on|off      开关云枢「自动连接内网」（对应设置里的同名开关）
+  ysctl setup [--force]  安装免密助手（只需输一次密码，之后 up/down 不再弹框）
+  ysctl fix              一键修复：重写免密规则 + 校正辅助功能 + 自检
+  ysctl unsetup          移除免密助手，恢复为每次验证密码
+  ysctl ax               打开「辅助功能」授权面板（只需授权一次）
+  ysctl doctor           环境自检
+  ysctl ui-dump          导出云枢界面元素（调试／校正按钮匹配）
+USAGE
+}
+
+# ── main ───────────────────────────────────────────────────────────────
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+
+cmd="${1:-status}"; shift 2>/dev/null || true
+case "$cmd" in
+  up)       cmd_up "$@" ;;
+  down)     cmd_down "$@" ;;
+  toggle)   cmd_toggle "$@" ;;
+  status)   cmd_status ;;
+  state)    cmd_state ;;
+  auto)     cmd_auto "$@" ;;
+  doctor)   cmd_doctor ;;
+  ui-dump)  cmd_ui_dump ;;
+  ax)       cmd_ax ;;
+  setup)    cmd_setup "$@" ;;
+  fix)      cmd_fix ;;
+  unsetup)  cmd_unsetup ;;
+  debug-script) cmd_debug_script "$@" ;;
+  -h|--help|help) usage ;;
+  -v|--version) print "ysctl $VERSION" ;;
+  *) err "未知命令：$cmd"; usage; exit 64 ;;
+esac

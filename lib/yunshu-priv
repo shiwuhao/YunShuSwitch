@@ -1,0 +1,95 @@
+#!/bin/zsh
+# yunshu-priv — 云枢守护进程启停的受限 root 助手
+# 由 `ysctl setup` 安装到 /usr/local/sbin/yunshu-priv（root:wheel 0755），
+# 配合 /etc/sudoers.d/yunshu-switch 的 NOPASSWD 规则，让 up / down 免密执行。
+#
+# 设计约束（安全关键）：
+#   1. 只接受 check / up / down 三个固定子命令，不拼接任何外部参数
+#   2. 路径与命令全部写死，不读取环境变量、不 source 任何文件
+#   3. 非 root 运行直接拒绝
+# 任何一项放宽都会让免密提权变成任意 root 代码执行。
+
+emulate -L zsh
+setopt no_unset
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+MGR_LABEL=com.eagleyun.sase.servicemanager
+HELPER_LABEL=com.eagleyun.sase.helper
+MGR_PLIST=/Library/LaunchDaemons/com.eagleyun.sase.servicemanager.plist
+HELPER_PLIST=/Library/LaunchDaemons/com.eagleyun.sase.helper.plist
+
+die() { print -ru2 -- "yunshu-priv: $*"; exit 1 }
+usage() { print -ru2 -- "usage: yunshu-priv check|up|down"; exit 64 }
+
+(( EUID == 0 )) || die "必须以 root 运行（请通过 sudo 调用）"
+(( $# == 1 ))   || usage
+
+case $1 in
+  check)
+    exit 0
+    ;;
+
+  up)
+    [[ -f $MGR_PLIST ]]    || die "缺少 $MGR_PLIST"
+    [[ -f $HELPER_PLIST ]] || die "缺少 $HELPER_PLIST"
+
+    /bin/launchctl enable system/$MGR_LABEL
+    /bin/launchctl enable system/$HELPER_LABEL
+    /bin/launchctl bootstrap system $MGR_PLIST    2>/dev/null || true
+    /bin/launchctl bootstrap system $HELPER_PLIST 2>/dev/null || true
+    sleep 0.4
+
+    # 用 kickstart（不是 -k）：已在跑就什么都不做；-k 会强制重启，白白多等数秒
+    rc=0
+    for L in $MGR_LABEL $HELPER_LABEL; do
+      if ! /bin/launchctl print system/$L >/dev/null 2>&1; then
+        /bin/launchctl kickstart system/$L 2>/dev/null || true
+        sleep 0.3
+      fi
+      if /bin/launchctl print system/$L >/dev/null 2>&1; then
+        print -r -- "  started: $L"
+      else
+        print -ru2 -- "  FAILED : $L"
+        rc=1
+      fi
+    done
+    exit $rc
+    ;;
+
+  down)
+    /bin/launchctl bootout system/$MGR_LABEL    2>/dev/null || true
+    /bin/launchctl bootout system/$HELPER_LABEL 2>/dev/null || true
+    sleep 0.3
+    /bin/launchctl disable system/$MGR_LABEL
+    /bin/launchctl disable system/$HELPER_LABEL
+    # KeepAlive 任务在 bootout 瞬间可能又拉起一轮子进程，多杀几轮
+    # 云枢的守护进程会捕获 SIGTERM 慢慢退（甚至不理），所以先 TERM 再 KILL
+    pat='/opt/\.yunshu/|com\.eagleyun\.sase\.helper'
+    i=0
+    while (( i < 5 )); do
+      if (( i < 2 )); then
+        /usr/bin/pkill    -f "$pat" 2>/dev/null || true
+      else
+        /usr/bin/pkill -KILL -f "$pat" 2>/dev/null || true
+      fi
+      sleep 0.35
+      (( i++ ))
+      /usr/bin/pgrep -f "$pat" >/dev/null 2>&1 || break
+    done
+
+    left="$(/usr/bin/pgrep -fl -f "$pat" 2>/dev/null)"
+    if [[ -n $left ]]; then
+      print -r -- "  daemons stopped & disabled"
+      print -r -- "  仍有残留进程（需重启或手动处理）:"
+      print -r -- "$left" | while read -r l; do print -r -- "    $l"; done
+    else
+      print -r -- "  daemons stopped & disabled (no leftovers)"
+    fi
+    exit 0
+    ;;
+
+  *)
+    usage
+    ;;
+esac
