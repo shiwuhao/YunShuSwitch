@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var disconnectItem: NSMenuItem!
     private var timer: Timer?
     private var axTimer: Timer?
+    private var beatTimer: Timer?
     private var trustTimer: Timer?
     private var busy = false
     private var currentState = ""          // connected / idle / off
@@ -34,6 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reqPath: String { supportDir + "/ax.request" }
     private var resPath: String { supportDir + "/ax.response" }
     private var statusPath: String { supportDir + "/ax.status" }
+    /// 心跳文件：每 2 秒刷新一次时间戳，ysctl 用它判断「App 到底在不在」。
+    /// 不能用 pgrep —— 从本 App 拉起的子进程里跑 pgrep，偶尔读不到 App 自己的
+    /// 命令行参数，会把「App 明明在跑」误判成「App 没在运行」（1.3.2 的 NOAPP 事故）。
+    private var alivePath: String { supportDir + "/app.alive" }
 
     // 云枢主程序
     private let yunshuBundleID = "com.eagleyun.sase"
@@ -82,7 +87,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollRequest()
         }
         RunLoop.main.add(axTimer!, forMode: .common)
+
+        writeHeartbeat()
+        beatTimer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            self?.writeHeartbeat()
+        }
+        RunLoop.main.add(beatTimer!, forMode: .common)
         logLine("supportDir=\(supportDir)")
+    }
+
+    /// 供 ysctl 判断「菜单栏 App 在不在」的心跳（时间戳 + PID）
+    private func writeHeartbeat() {
+        let body = "\(Int(Date().timeIntervalSince1970))\n\(ProcessInfo.processInfo.processIdentifier)\n"
+        try? body.write(toFile: alivePath, atomically: true, encoding: .utf8)
     }
 
     /// 首次使用检查：`/usr/local/sbin/yunshu-priv` + sudoers 规则缺失时提示一键配置。
@@ -577,6 +594,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "dump":
             guard AXIsProcessTrusted() else { return "NOAX" }
             return self.axDump()
+        case "diag":
+            guard AXIsProcessTrusted() else { return "NOAX" }
+            return self.axDiag()
+        case "ping":
+            return "PONG"
         default:
             return "ERR:unknown command \(cmd)"
         }
@@ -638,6 +660,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let role: String
         let label: String
         let depth: Int
+        let frame: CGRect
+        let enabled: Bool
+    }
+
+    private func axFrame(_ el: AXUIElement) -> CGRect {
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        if let v = attr(el, kAXPositionAttribute as String), CFGetTypeID(v as CFTypeRef) == AXValueGetTypeID() {
+            _ = AXValueGetValue(unsafeBitCast(v as CFTypeRef, to: AXValue.self), .cgPoint, &origin)
+        }
+        if let v = attr(el, kAXSizeAttribute as String), CFGetTypeID(v as CFTypeRef) == AXValueGetTypeID() {
+            _ = AXValueGetValue(unsafeBitCast(v as CFTypeRef, to: AXValue.self), .cgSize, &size)
+        }
+        return CGRect(origin: origin, size: size)
+    }
+
+    private func axEnabled(_ el: AXUIElement) -> Bool {
+        (attr(el, kAXEnabledAttribute as String) as? Bool) ?? true
+    }
+
+    /// 元素本身支持不支持 AXPress（比按 role 白名单猜更准，能避开纯展示的分组/图片）
+    private func canPress(_ el: AXUIElement) -> Bool {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(el, &names) == .success,
+              let list = names as? [String] else { return false }
+        return list.contains(kAXPressAction as String)
     }
 
     /// 递归收集元素及其可读文本，用于关键词匹配
@@ -651,7 +699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             str(el, kAXHelpAttribute as String),
             str(el, kAXIdentifierAttribute as String)
         ].joined(separator: "\u{1F}")
-        out.append(Node(el: el, role: role, label: label, depth: depth))
+        out.append(Node(el: el, role: role, label: label, depth: depth,
+                        frame: axFrame(el), enabled: axEnabled(el)))
         for c in kids(el) { collect(c, depth: depth + 1, into: &out) }
     }
 
@@ -668,23 +717,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private let pressableRoles: Set<String> = [
-        "AXButton", "AXLink", "AXCheckBox", "AXRadioButton", "AXMenuItem", "AXMenuButton", "AXPopUpButton"
+        "AXButton", "AXLink", "AXCheckBox", "AXSwitch", "AXRadioButton",
+        "AXMenuItem", "AXMenuButton", "AXPopUpButton", "AXToolbarButton"
     ]
 
-    private func findAndPress(_ axApp: AXUIElement, keywords: [String], excludes: [String]) -> Bool {
-        let nodes = snapshot(axApp)
-        var fallback: AXUIElement?
-        for n in nodes {
+    /// 老界面/菜单项：控件带可读标题（如「立即连接」「连接网络」），按文案直接点
+    private func findAndPressKeywords(_ keywords: [String], _ excludes: [String]) -> Bool {
+        guard let axApp = axApp() else { return false }
+        for n in snapshot(axApp) {
             if excludes.contains(where: { n.label.contains($0) }) { continue }
             guard keywords.contains(where: { n.label.contains($0) }) else { continue }
-            if pressableRoles.contains(n.role) {
-                if AXUIElementPerformAction(n.el, kAXPressAction as CFString) == .success { return true }
-            } else if fallback == nil {
-                fallback = n.el
+            guard n.enabled, canPress(n.el) || pressableRoles.contains(n.role) else { continue }
+            if AXUIElementPerformAction(n.el, kAXPressAction as CFString) == .success {
+                logLine("title press: \(n.role) \(n.label.prefix(24))")
+                return true
             }
-        }
-        if let f = fallback, AXUIElementPerformAction(f, kAXPressAction as CFString) == .success {
-            return true
         }
         return false
     }
@@ -711,70 +758,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 轮询查找并点击：0.1 秒一探，元素一出现就点，命中立即返回。
-    /// 旧实现是「试一次 → 固定睡 1 秒 → 再试」，云枢冷启动那 3 秒里每次都在白睡，
-    /// 光等待就多花 2~3 秒。
-    private func axPress(_ keywords: [String], _ excludes: [String], timeout: Double = 20) -> String {
-        guard yunshuApp() != nil else { return "NOUI" }
-        let deadline = Date().addingTimeInterval(timeout)
-        var lastCount = -1
-        var panelOpened = false
-        var sawEmpty = 0
-
-        while Date() < deadline {
-            if let axApp = axApp() {
-                let nodes = snapshot(axApp)
-                if nodes.count != lastCount {
-                    lastCount = nodes.count
-                    logLine("axPress elements=\(nodes.count) panel=\(panelOpened)")
-                }
-                if nodes.isEmpty {
-                    // 界面还没建起来（冷启动），只等，不去戳状态栏图标
-                    sawEmpty += 1
-                } else {
-                    if findAndPress(axApp, keywords: keywords, excludes: excludes) {
-                        if panelOpened { closeStatusPanel() }
-                        return "OK"
-                    }
-                    if !panelOpened, let item = statusItemElement() {
-                        if AXUIElementPerformAction(item, kAXPressAction as CFString) == .success {
-                            panelOpened = true
-                        }
-                    }
-                }
-            }
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        if panelOpened { closeStatusPanel() }
-        logLine("axPress timeout, elements=\(lastCount) emptyRounds=\(sawEmpty)")
-        return "NOBTN"
+    /// 菜单真的展开时才收起，避免"点一下反而把它打开"
+    private func closeMenuIfOpen() {
+        guard let axApp = axApp() else { return }
+        let open = snapshot(axApp).contains { $0.role == "AXMenuItem" && $0.frame.width > 1 }
+        guard open, let item = statusItemElement() else { return }
+        _ = AXUIElementPerformAction(item, kAXPressAction as CFString)
+        Thread.sleep(forTimeInterval: 0.1)
     }
 
-    private func axPressConnect() -> String {
-        let kws = ["连接网络", "立即连接企业内网", "立即连接", "一键连接", "连接企业内网", "连接内网", "点击连接"]
-        let ex = ["断开", "取消", "注销", "退出", "申请", "权限", "诊断", "打开云枢"]
-        let r = axPress(kws, ex, timeout: 20)
-        guard r == "OK" else { return r }
-
-        // 云枢冷启动时第一次点击可能被静默忽略：菜单不报错、隧道也不建立。
-        // 文案只在隧道真正建立后才翻成「断开网络」，所以给 8 秒窗口（实测建隧道 2~5 秒）：
-        // 翻了就立刻返回；窗口内没翻说明点空了，补点一次。窗口别设太短，
-        // 否则会把「还在连接中」误判成点空，补点反而打断正在进行的那次连接。
-        for round in 0..<2 {
-            if extrasLabels().isEmpty { return "OK" }
-            let deadline = Date().addingTimeInterval(8.0)
-            while Date() < deadline {
-                if !connectStillOffered() { return "OK" }
-                Thread.sleep(forTimeInterval: 0.15)
-            }
-            logLine("verify round \(round + 1): 8 秒内菜单仍显示「连接网络」，补点一次")
-            _ = axPress(kws, ex, timeout: 4)
-        }
-        logLine("verify: 多次点击后菜单仍是「连接网络」（可能需要二次认证）")
-        return "OK"
-    }
-
-    /// 菜单栏图标下挂的菜单文案（面板不展开时也能读到，且随状态变化）
+    /// 菜单栏图标的原生菜单文案：「连接网络 / 断开网络」，随状态变化。
+    /// 面板没展开时也能读到，所以用它判断"到底连上没有"。
     private func extrasLabels() -> [String] {
         guard let axApp = axApp() else { return [] }
         guard let mb = axChild(axApp, kAXExtrasMenuBarAttribute as String) else { return [] }
@@ -783,15 +777,212 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nodes.map { $0.label }
     }
 
-    private func connectStillOffered() -> Bool {
-        extrasLabels().contains { $0.contains("连接网络") }
+    private enum MenuState: String { case on, off, unknown }
+
+    private func menuState() -> MenuState {
+        let labels = extrasLabels()
+        if labels.isEmpty { return .unknown }
+        if labels.contains(where: { $0.contains("断开网络") || $0.contains("断开连接") }) { return .on }
+        if labels.contains(where: { $0.contains("连接网络") }) { return .off }
+        return .unknown
+    }
+
+    /// 走云枢菜单栏图标的原生菜单项：文案固定、带真实可点击区域，
+    /// 是新版界面里最稳的一条路（窗口里那排按钮标题是空的，按文案找根本找不到）。
+    private func pressStatusMenuItem(keywords: [String], excludes: [String]) -> Bool {
+        guard let axApp = axApp(), let item = statusItemElement() else { return false }
+        guard AXUIElementPerformAction(item, kAXPressAction as CFString) == .success else { return false }
+        Thread.sleep(forTimeInterval: 0.35)
+
+        let nodes = snapshot(axApp)
+        var target: Node?
+        for n in nodes {
+            if excludes.contains(where: { n.label.contains($0) }) { continue }
+            guard keywords.contains(where: { n.label.contains($0) }) else { continue }
+            guard n.enabled, n.frame.width > 1,
+                  canPress(n.el) || pressableRoles.contains(n.role) else { continue }
+            target = n
+            break
+        }
+        guard let t = target else {
+            closeMenuIfOpen()
+            logLine("menu: 展开后没找到 \(keywords.first ?? "") 项")
+            return false
+        }
+        let ok = AXUIElementPerformAction(t.el, kAXPressAction as CFString) == .success
+        Thread.sleep(forTimeInterval: 0.2)
+        closeMenuIfOpen()
+        logLine("menu press \(t.label.prefix(20)) ok=\(ok)")
+        return ok
+    }
+
+    /// 新版界面兜底：窗口里「内网连接」那一行的开关没有可读标题（AXButton 标题为空），
+    /// 只能按几何位置找 —— 取含「内网连接 / 网络状态」的文本行，与它同一水平线、
+    /// 宽度大于 0 且支持 AXPress 的控件就是那个开关。
+    private func pressNetworkRowControl() -> Bool {
+        guard let axApp = axApp() else { return false }
+        let nodes = snapshot(axApp)
+        let anchors = ["内网连接", "企业内网", "网络状态", "连接状态"]
+        var anchor: CGRect?
+        for a in anchors {
+            if let n = nodes.first(where: { $0.label.contains(a) && $0.frame.width > 2 }) {
+                anchor = n.frame
+                break
+            }
+        }
+        guard let a = anchor else {
+            logLine("row: 没找到「内网连接」文本")
+            return false
+        }
+
+        func rank(_ role: String) -> Int {
+            switch role {
+            case "AXButton": return 0
+            case "AXSwitch": return 1
+            case "AXCheckBox": return 2
+            case "AXMenuItem": return 3
+            default: return 8
+            }
+        }
+        let bad = ["申请", "诊断", "帮助", "权限", "退出", "注销", "公告", "工作台", "软件中心", "设置"]
+        var cands = nodes.filter { n in
+            n.enabled && n.frame.width > 4 && n.frame.height > 4
+                && abs(n.frame.midY - a.midY) <= 26
+                && !bad.contains(where: { n.label.contains($0) })
+                && canPress(n.el)
+        }
+        cands.sort { l, r in
+            let rl = rank(l.role), rr = rank(r.role)
+            if rl != rr { return rl < rr }
+            return abs(l.frame.midX - a.midX) < abs(r.frame.midX - a.midX)
+        }
+        for c in cands.prefix(3) {
+            if AXUIElementPerformAction(c.el, kAXPressAction as CFString) == .success {
+                logLine("row press: \(c.role) \(c.label.prefix(16)) @\(Int(c.frame.minX)),\(Int(c.frame.midY))")
+                return true
+            }
+        }
+        logLine("row: 行内没有可点控件（候选 \(cands.count)）")
+        return false
+    }
+
+    /// 等菜单文案翻面（连接 2~5 秒才建立隧道，所以窗口给 9 秒）
+    private func waitMenuState(_ want: MenuState, seconds: Double) -> MenuState {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            let s = menuState()
+            if s == want { return s }
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        return menuState()
+    }
+
+    private let connectKeywords = ["连接网络", "立即连接企业内网", "立即连接", "一键连接",
+                                   "连接企业内网", "连接内网", "点击连接"]
+    private let disconnectKeywords = ["断开网络", "断开连接内网", "断开连接", "断开内网",
+                                      "立即断开", "退出网络"]
+    // 「连接」「断开」两条路的排除词必须对称，否则会互相点错
+    private let pressExcludes = ["取消", "注销", "退出", "申请", "权限", "诊断", "打开云枢",
+                                 "帮助", "日志", "设置"]
+
+    /// 「内网连接」那一行右侧的状态文字（未开启 / 连接中 / 已开启 …）。
+    /// 云枢正在握手时也会有 2~5 秒的「连接中」，这时候再点只会打断它。
+    private func rowSaysConnecting() -> Bool {
+        guard let axApp = axApp() else { return false }
+        let nodes = snapshot(axApp)
+        guard let a = nodes.first(where: { $0.label.contains("内网连接") && $0.frame.width > 2 })?.frame
+        else { return false }
+        let words = ["连接中", "正在连接", "认证中", "正在认证", "重连"]
+        return nodes.contains { n in
+            n.role == "AXStaticText" && !n.label.isEmpty
+                && abs(n.frame.midY - a.midY) <= 16
+                && words.contains(where: { n.label.contains($0) })
+        }
+    }
+
+    /// 连接：在截止时间内**轮询**（云枢冷启动要 1~3 秒才把界面/菜单建出来，
+    /// 只试一次必然落空 —— 1.3.3 首版就是这么翻车的），并分阶段升级手段：
+    ///   0 秒起：按文案点（云枢菜单栏菜单里的「连接网络」，实测 1 秒内命中）
+    ///   2 秒起：显式展开菜单再点（菜单项未展开时偶尔点不动）
+    ///   6 秒起：按位置点「内网连接」那一行的开关（新版界面按钮没有可读标题时唯一的路）
+    /// 每次点完都用菜单文案确认；没翻面就继续（冷启动第一次点击常被静默忽略）。
+    private func axPressConnect() -> String {
+        guard yunshuApp() != nil else { return "NOUI" }
+        if menuState() == .on { logLine("connect: 菜单已是「断开网络」，本来就连着"); return "OK" }
+
+        let start = Date()
+        let deadline = start.addingTimeInterval(18)
+        var triedMenu = false, triedRow = false, presses = 0
+
+        while Date() < deadline {
+            let elapsed = Date().timeIntervalSince(start)
+
+            if findAndPressKeywords(connectKeywords, pressExcludes) {
+                presses += 1
+                logLine("connect: 文案点击 #\(presses) at \(String(format: "%.1f", elapsed))s")
+                if waitMenuState(.on, seconds: 5) != .off { return "OK" }
+                if rowSaysConnecting() {
+                    logLine("connect: 界面显示连接中，继续等，不重复点")
+                    continue
+                }
+                continue
+            }
+            if elapsed > 2, !triedMenu {
+                triedMenu = true
+                if pressStatusMenuItem(keywords: connectKeywords, excludes: pressExcludes) {
+                    presses += 1
+                    logLine("connect: 菜单点击 at \(String(format: "%.1f", elapsed))s")
+                    if waitMenuState(.on, seconds: 5) != .off { return "OK" }
+                    continue
+                }
+            }
+            if elapsed > 6, !triedRow {
+                triedRow = true
+                if pressNetworkRowControl() {
+                    presses += 1
+                    logLine("connect: 行内点击 at \(String(format: "%.1f", elapsed))s")
+                    if waitMenuState(.on, seconds: 5) != .off { return "OK" }
+                    continue
+                }
+            }
+            if presses >= 3 { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if presses > 0 {
+            logLine("connect: 点过 \(presses) 次，菜单仍未翻成「断开网络」")
+            return "OK"        // 交给上层按隧道判断，别误报成「找不到按钮」
+        }
+        logLine("connect: 18 秒内没找到任何可点的「连接」控件")
+        return "NOBTN"
     }
 
     private func axPressDisconnect() -> String {
-        axPress(
-            ["断开网络", "断开连接内网", "断开连接", "断开内网", "立即断开", "退出网络"],
-            ["取消", "退出", "诊断", "打开云枢"]
-        )
+        guard yunshuApp() != nil else { return "NOUI" }
+        if menuState() == .off { return "OK" }
+
+        let start = Date()
+        let deadline = start.addingTimeInterval(12)
+        var triedMenu = false, presses = 0
+
+        while Date() < deadline {
+            let elapsed = Date().timeIntervalSince(start)
+            if findAndPressKeywords(disconnectKeywords, pressExcludes) {
+                presses += 1
+                if waitMenuState(.off, seconds: 5) != .on { return "OK" }
+                continue
+            }
+            if elapsed > 1.5, !triedMenu {
+                triedMenu = true
+                if pressStatusMenuItem(keywords: disconnectKeywords, excludes: pressExcludes) {
+                    presses += 1
+                    if waitMenuState(.off, seconds: 5) != .on { return "OK" }
+                    continue
+                }
+            }
+            if presses >= 2 { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return presses > 0 ? "OK" : "NOBTN"
     }
 
     private func axDump() -> String {
@@ -810,13 +1001,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         var lines: [String] = []
         let winCount = (attr(axApp, kAXWindowsAttribute as String) as? [AXUIElement])?.count ?? 0
-        lines.append("windows: \(winCount)  elements: \(nodes.count)")
+        let pressableCount = nodes.filter { $0.enabled && canPress($0.el) }.count
+        lines.append("windows: \(winCount)  elements: \(nodes.count)  pressable: \(pressableCount)  menu: \(menuState().rawValue)")
         for n in nodes.prefix(800) {
             let shown = n.label.replacingOccurrences(of: "\u{1F}", with: " | ")
                 .trimmingCharacters(in: CharacterSet(charactersIn: " |"))
-            lines.append("\(String(repeating: "  ", count: min(n.depth, 6)))[\(n.role)] \(shown)")
+            let f = "x\(Int(n.frame.minX)) y\(Int(n.frame.minY)) w\(Int(n.frame.width)) h\(Int(n.frame.height))"
+            let press = canPress(n.el) ? "P" : "-"
+            let dis = n.enabled ? "" : " disabled"
+            lines.append("\(String(repeating: "  ", count: min(n.depth, 6)))[\(n.role)] <\(f)> \(press)\(dis) \(shown)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// 一键诊断：把「ysctl 到底卡在哪」一次性写清楚，省去来回问。
+    private func axDiag() -> String {
+        var out: [String] = []
+        let pid = ProcessInfo.processInfo.processIdentifier
+        out.append("appPid=\(pid)")
+        out.append("trusted=\(AXIsProcessTrusted())")
+        out.append("heartbeat=\(alivePath)")
+        if let app = yunshuApp() {
+            out.append("yunshuPid=\(app.processIdentifier) bundle=\(app.bundleIdentifier ?? "-")")
+        } else {
+            out.append("yunshuPid=nil（云枢主程序没在跑？）")
+        }
+        guard let axApp = axApp() else {
+            out.append("axApp=nil")
+            return out.joined(separator: "\n")
+        }
+        let nodes = snapshot(axApp)
+        out.append("elements=\(nodes.count) pressable=\(nodes.filter { $0.enabled && canPress($0.el) }.count)")
+        out.append("menu=\(menuState().rawValue) labels=\(extrasLabels().filter { !$0.isEmpty && $0 != "-" }.prefix(6).joined(separator: "/"))")
+        let wins = (attr(axApp, kAXWindowsAttribute as String) as? [AXUIElement])?.count ?? 0
+        out.append("windows=\(wins)")
+        let anchors = nodes.filter { $0.label.contains("内网连接") || $0.label.contains("网络状态") }
+        for a in anchors.prefix(4) {
+            out.append("anchor [\(a.role)] \"\(a.label.prefix(20))\" x\(Int(a.frame.minX)) y\(Int(a.frame.minY)) "
+                       + "w\(Int(a.frame.width)) h\(Int(a.frame.height))")
+        }
+        let row = nodes.filter { $0.enabled && canPress($0.el) && $0.frame.width > 4 }
+        out.append("可点控件 \(row.count) 个（前 6 个）：")
+        for n in row.prefix(6) {
+            out.append("  [\(n.role)] \"\(n.label.prefix(16))\" x\(Int(n.frame.minX)) y\(Int(n.frame.midY)) "
+                       + "w\(Int(n.frame.width)) h\(Int(n.frame.height))")
+        }
+        return out.joined(separator: "\n")
     }
 
     // MARK: - 辅助

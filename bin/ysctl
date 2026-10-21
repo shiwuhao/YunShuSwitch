@@ -17,7 +17,7 @@ zmodload zsh/datetime 2>/dev/null   # EPOCHREALTIME / strftime，用于计时与
 setopt no_unset
 unsetopt pipe_fail 2>/dev/null
 
-VERSION="1.3.2"
+VERSION="1.3.3"
 
 # ── 云枢固定结构（如后续版本变动，改这里即可） ─────────────────────────
 UI_APP="/Applications/Yunshu.app"
@@ -304,7 +304,20 @@ app_path() {
 }
 
 # 用可执行文件名匹配，不依赖 .app 目录名（安装后目录名是「云枢开关.app」）
-app_running() { pgrep -f 'Contents/MacOS/YunshuSwitch' >/dev/null 2>&1 }
+# 注意：**不能只靠 pgrep**。从 App 自己拉起的子进程里跑 pgrep，偶尔读不到 App 的
+# 命令行参数，会把「App 明明在跑」判成「没在运行」——1.3.2 的 NOAPP 事故就是这么来的。
+# App 每 2 秒写一次 app.alive（时间戳），心跳比 pgrep 可靠，也更快。
+app_heartbeat_age() {
+  local f="$STATE_DIR/app.alive" mt
+  [[ -f $f ]] || { print -r -- 99999; return }
+  mt=$(stat -f %m "$f" 2>/dev/null) || { print -r -- 99999; return }
+  print -r -- $(( ${EPOCHSECONDS:-0} - mt ))
+}
+
+app_running() {
+  pgrep -f 'Contents/MacOS/YunshuSwitch' >/dev/null 2>&1 && return 0
+  (( $(app_heartbeat_age) <= 10 ))
+}
 
 # 启动菜单栏 App：先按路径，再按 bundle id（App 被移动过也能找到）
 app_launch() {
@@ -328,18 +341,17 @@ ax_ensure_app() {
   return 1
 }
 
-# 通过请求文件与 App 通信（App 每 0.2 秒轮询一次）
-ax_call() {  # $1 = connect|disconnect|dump|trust
-  local cmd="$1" nonce="$$.${RANDOM}${RANDOM}"
+# 一轮"写请求 → 等响应"。$1 命令 $2 nonce $3 最多等几秒
+# 成功：把 App 的回答打到 stdout 并返回 0；超时返回 1（不打印东西）
+_ax_round() {
+  local cmd="$1" nonce="$2" secs="${3:-40}"
   local req="$STATE_DIR/ax.request" res="$STATE_DIR/ax.response"
-  mkdir -p "$STATE_DIR"
-  ax_ensure_app || { print -r -- "NOAPP"; return 1 }
   rm -f "$res"
-  { print -r -- "$nonce"; print -r -- "$cmd" } > "$req.tmp" 2>/dev/null || { print -r -- "NOAPP"; return 1 }
-  mv -f "$req.tmp" "$req" 2>/dev/null || { print -r -- "NOAPP"; return 1 }
+  { print -r -- "$nonce"; print -r -- "$cmd" } > "$req.tmp" 2>/dev/null || return 1
+  mv -f "$req.tmp" "$req" 2>/dev/null || return 1
 
-  local i body
-  for i in {1..300}; do            # 最长 30 秒
+  local dl=$(( ${EPOCHREALTIME:-0} + secs )) body
+  while (( ${EPOCHREALTIME:-0} < dl )); do
     if [[ -f $res ]]; then
       body=$(<"$res")
       if [[ ${body%%$'\n'*} == $nonce ]]; then
@@ -348,19 +360,48 @@ ax_call() {  # $1 = connect|disconnect|dump|trust
         return 0
       fi
     fi
-    sleep 0.1
+    sleep 0.05
   done
   rm -f "$req"
-  print -r -- "TIMEOUT"
+  return 1
+}
+
+# 通过请求文件与 App 通信（App 每 0.1 秒轮询一次）
+# 顺序：先直接发请求（App 在跑就最快）→ 没有响应再拉起 App 重试一次 → 还不行才 NOAPP。
+# 不再"先判断 App 在不在"，因为那个判断本身就出过错。
+ax_call() {  # $1 = connect|disconnect|dump|trust|diag|ping
+  local cmd="$1" nonce="$$.${RANDOM}${RANDOM}" out
+  local secs=45
+  case "$cmd" in
+    ping|trust) secs=8 ;;
+    dump|diag)  secs=25 ;;
+    disconnect) secs=30 ;;
+  esac
+  mkdir -p "$STATE_DIR"
+
+  out=$(_ax_round "$cmd" "$nonce" "$secs") && { print -r -- "$out"; return 0 }
+
+  # 没响应：拉起 App（已在跑时 open 只是激活，无副作用），再试一轮
+  app_launch || { print -r -- "NOAPP"; return 1 }
+  _log "UI  App 未响应请求，已拉起并重试（心跳 $(app_heartbeat_age)s）" >/dev/null 2>&1
+  app_running || { print -r -- "NOAPP"; return 1 }
+
+  out=$(_ax_round "$cmd" "$nonce" "$secs") && { print -r -- "$out"; return 0 }
+  print -r -- "NOAPP"
   return 1
 }
 
 # 返回：OK / NOUI / NOAX / NOBTN / NOAPP / ERR:...
-ui_action() {  # $1 = connect|disconnect|dump
+ui_action() {  # $1 = connect|disconnect|dump|diag
   local act="$1" out
-  if app_running || app_path >/dev/null; then
+  if app_running || app_path >/dev/null 2>&1; then
     out=$(ax_call "$act")
     _log "UI  $act -> ${out%%$'\n'*}" >/dev/null 2>&1
+    if [[ $out == NOAPP && -f $UI_SCRIPT ]]; then
+      # 新版通道不通时的退路：老式 osascript（需要给终端授权，一般不推荐）
+      local alt
+      alt=$(osascript "$UI_SCRIPT" "$act" 2>&1) && out=$alt
+    fi
     print -r -- "$out"
     return 0
   fi
@@ -607,9 +648,15 @@ cmd_up() {
   fi
 
   step "4/4 触发“连接”"
+  # 先把菜单栏 App 拉起来：它是唯一持有「辅助功能」授权的进程，也是真正去点按钮的那个。
+  # 首次安装后它可能没在跑（或刚被替换），提前拉起能省掉一轮失败重试。
+  if ! app_running; then
+    info "拉起菜单栏 App（首次使用会请求一次辅助功能授权）"
+    app_launch && wait_until app_running 12 || true
+  fi
   # 最多点 3 次：冷启动时云枢自己还没接上本地服务，第一次点击可能被静默忽略，
   # 这时隧道不会出现，再点一次即可（实测第二次必中）。
-  local attempt=1 r
+  local attempt=1 r noapp=0
   while (( attempt <= 3 )); do
     r=$(ui_action connect)
     case "$r" in
@@ -623,11 +670,20 @@ cmd_up() {
         info "  3. 或在云枢界面手动点一下「立即连接」"
         break ;;
       NOAPP)
+        # App 可能正在启动（首次要过 Gatekeeper），再给一次机会，别直接放弃
+        if (( noapp == 0 )); then
+          noapp=1
+          warn "菜单栏 App 没有响应，正在重试…"
+          app_launch >/dev/null 2>&1 || true
+          wait_until app_running 10 || true
+          continue
+        fi
         warn "菜单栏 App 没在运行，且自动拉起失败，无法替你点按钮"
         info "处理办法："
         info "  1. 打开「应用」里的 YunshuSwitch，或执行 open -b $APP_BUNDLE_ID"
         info "  2. 或直接点菜单栏云枢图标 → 连接网络"
         info "  3. 若 App 已被删掉，在项目目录执行 ./install.sh 重装"
+        info "  4. 排查：执行 ysctl diag 看 App 与界面元素状态"
         break ;;
       NOUI)
         warn "云枢界面未就绪，请手动点一下「立即连接」"
@@ -923,6 +979,27 @@ cmd_ui_dump() {
   info "已输出 $(print -r -- "$out" | wc -l | tr -d ' ') 行"
 }
 
+cmd_diag() {
+  step "云枢开关 · 诊断"
+  print -r -- "  ysctl      : $VERSION  ($SELF)"
+  print -r -- "  App        : $(app_path 2>/dev/null || print '未找到')"
+  print -r -- "  App 进程   : $(app_running && print '在运行' || print '未运行')"
+  print -r -- "    心跳文件 : $(app_heartbeat_age)s 前（>10s 视为没在跑）"
+  print -r -- "    pgrep    : $(pgrep -fl 'Contents/MacOS/YunshuSwitch' 2>/dev/null | head -1)"
+  print -r -- "  授权状态   : $(ui_ax_ok && print 'trusted' || print 'untrusted/未知')"
+  print -r -- "  云枢进程   : $(ui_running && print '在运行' || print '未运行')"
+  print -r -- "  隧道       : $(tunnel_info 2>/dev/null || print '无')"
+  print -r -- ""
+  local out
+  out=$(ui_action diag)
+  case "$out" in
+    NOAX)  err "缺少「辅助功能」权限：执行 ysctl ax 打开授权面板" ;;
+    NOAPP) err "菜单栏 App 没有响应（刚装好时先手动打开一次 云枢开关.app）" ;;
+    NOUI)  err "云枢主程序没在运行：先执行 ysctl up（会自动拉起）" ;;
+    *)     print -r -- "$out" ;;
+  esac
+}
+
 cmd_setup() {
   local force=0 a
   for a in "$@"; do [[ $a == "--force" ]] && force=1; done
@@ -1058,6 +1135,7 @@ ysctl — 云枢一键开关
   ysctl unsetup          移除免密助手，恢复为每次验证密码
   ysctl ax               打开「辅助功能」授权面板（只需授权一次）
   ysctl doctor           环境自检
+  ysctl diag             深度诊断（App 心跳、授权、界面元素、隧道）
   ysctl ui-dump          导出云枢界面元素（调试／校正按钮匹配）
 USAGE
 }
@@ -1075,6 +1153,7 @@ case "$cmd" in
   statusline) cmd_statusline ;;
   auto)     cmd_auto "$@" ;;
   doctor)   cmd_doctor ;;
+  diag)     cmd_diag ;;
   ui-dump)  cmd_ui_dump ;;
   ax)       cmd_ax ;;
   setup)    cmd_setup "$@" ;;

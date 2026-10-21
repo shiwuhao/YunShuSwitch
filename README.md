@@ -104,6 +104,7 @@ ysctl status        # 详细状态
 ysctl state         # 只输出 connected / idle / off
 ysctl fix           # 一键修复：免密规则 + 辅助功能 + 自检
 ysctl doctor        # 环境自检
+ysctl diag          # 深度诊断：App 心跳、可点控件、界面锚点、隧道
 ```
 
 嫌长就加别名（`~/.zshrc`）：

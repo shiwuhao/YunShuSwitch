@@ -7,7 +7,7 @@
   "CFBundleName" = "云枢开关";
   "CFBundleDisplayName" = "云枢开关";
   "CFBundlePackageType" = "APPL";
-  "CFBundleShortVersionString" = "1.3.2";
+  "CFBundleShortVersionString" = "1.3.3";
   "CFBundleVersion" = "132";
   "LSMinimumSystemVersion" = "13.0";
   "LSUIElement" = true;
