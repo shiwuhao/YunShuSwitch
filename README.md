@@ -35,7 +35,7 @@
 
 **① 下载安装盘** → [**Releases · 最新版 YunShuSwitch.dmg**](../../releases/latest)（约 700 KB）
 
-> 也可以直接用仓库里的 [`dist/YunShuSwitch.dmg`](dist/YunShuSwitch.dmg)，与 Release 内容等价。
+> 也可以直接用仓库里的 [`dist/YunShuSwitch.dmg`](dist/YunShuSwitch.dmg)（本机构建，带背景排版；Release 里的是 CI 构建，仅少一层背景图）。
 
 **② 双击打开，把左边的「云枢开关」拖到右边的「应用程序」**
 
